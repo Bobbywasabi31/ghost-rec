@@ -32,7 +32,7 @@ import mss
 import numpy as np
 
 # ----------------------------- CONFIG ---------------------------------
-FPS = 30
+FPS = 60
 MONITOR_INDEX = 1            # 1 = primary monitor, 0 = all monitors at once
 OUTPUT_DIR = Path.home() / "Videos" / "ghost"
 HOTKEY_TOGGLE = "ctrl+shift+r"
