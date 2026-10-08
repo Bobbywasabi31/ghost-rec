@@ -54,6 +54,19 @@ partial track; re-enabling restarts from that moment and discards the
 earlier partial segment. If audio capture fails for any reason, the
 session just records video — your video is never at risk.
 
+## Tests
+
+`tests/` runs the session/mux/toggle logic headless on Linux CI: stub
+modules stand in for `mss`, `keyboard`, and `sounddevice` (which reports
+no WASAPI, like any non-Windows host), and the real encoder
+(imageio-ffmpeg) validates the MP4s. Hotkeys, real WASAPI capture, and
+`pythonw` behaviour still need a Windows machine (see `docs/`).
+
+```
+pip install -r requirements.txt pytest
+pytest -q
+```
+
 ## Notes
 
 - **How you know it's recording:** check the output folder — the MP4 for

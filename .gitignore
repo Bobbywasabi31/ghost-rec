@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# ghost-rec runtime outputs (never committed)
+*.mp4
+*.wav
+ghost.log
+audio.enabled
