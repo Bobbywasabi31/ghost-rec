@@ -3,3 +3,4 @@ keyboard
 imageio
 imageio-ffmpeg
 numpy
+sounddevice  # optional: system-audio capture (WASAPI loopback, Windows only)
