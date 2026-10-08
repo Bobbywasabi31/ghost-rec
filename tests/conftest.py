@@ -11,8 +11,13 @@ imported:
                "no WASAPI on this platform" graceful-fallback path
 """
 
+import os
 import sys
 import types
+
+# Make the repo root (where ghost_rec.py lives) importable even when the
+# tests are run from elsewhere, e.g. plain `pytest` in CI.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
