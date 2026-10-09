@@ -16,7 +16,9 @@ Hotkeys (change in CONFIG below):
     Ctrl+Shift+Q .... quit the recorder entirely
 
 Files land in  %USERPROFILE%\\Videos\\ghost\\  as ghost_YYYY-MM-DD_HH-MM-SS.mp4
-A tiny ghost.log in the same folder records start/stop times (no content).
+A tiny ghost.log in the same folder records start/stop times (no content),
+and sessions.jsonl keeps one JSON line per finished session (timestamps,
+duration, file name, size, audio on/off) for your own review.
 
 Reliability notes (logic audit 2026-10-08):
 - The capture loop is paced to FPS: every appended frame is stamped
@@ -41,6 +43,7 @@ Audio notes (added 2026-10-08; NOT yet tested on Windows):
 """
 
 import os
+import json
 import queue
 import socket
 import subprocess
@@ -65,6 +68,7 @@ HOTKEY_QUIT = "ctrl+shift+q"
 CRF = 20                     # video quality: 18 = near-lossless/big, 23 = small
 SINGLE_INSTANCE_PORT = 53917  # localhost only; change if it clashes
 AUDIO_SAMPLE_FORMAT = "<i2"   # 16-bit PCM in the temp WAV
+SESSION_LOG_MAX_LINES = 5000  # sessions.jsonl keeps the newest this many entries
 # ------------------------------------------------------------------------
 
 _state_lock = threading.Lock()
@@ -74,6 +78,8 @@ _frames: "queue.Queue | None" = None  # current session's queue; None when idle
 _session_thread: threading.Thread | None = None
 _session_path: Path | None = None
 _session_start_t = 0.0  # time.time() when the current session started
+_session_meta: "dict | None" = None  # set at session start, consumed once when
+                                     # the session's sessions.jsonl entry is written
 _wake = threading.Event()  # set when a session starts; lets the idle grab
                            # loop wake promptly instead of sleeping blind
 
@@ -101,6 +107,76 @@ def _log(msg: str) -> None:
 
 def _audio_flag_path() -> Path:
     return OUTPUT_DIR / "audio.enabled"
+
+
+def _session_log_append(entry: dict) -> None:
+    """Append one session entry to sessions.jsonl (one JSON object per line).
+
+    Local only, append-only, no network -- it exists purely for Alex's own
+    review of what was recorded. When the file grows past
+    SESSION_LOG_MAX_LINES, the oldest lines are dropped (atomic rewrite).
+    """
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = OUTPUT_DIR / "sessions.jsonl"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        _rotate_session_log(log_path)
+    except OSError:
+        pass  # same philosophy as _log: never break recording over logging
+
+
+def _rotate_session_log(log_path: Path) -> None:
+    """Drop the oldest lines once sessions.jsonl exceeds the line cap."""
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+    if len(lines) <= SESSION_LOG_MAX_LINES:
+        return
+    tmp = log_path.with_name(log_path.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(lines[-SESSION_LOG_MAX_LINES:])
+        os.replace(tmp, log_path)  # atomic: readers never see a half file
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _record_session_entry(path: Path | None, audio: bool) -> None:
+    """Append this session's line to sessions.jsonl.
+
+    Called exactly once per started session: from _end_session on a normal
+    stop (after the audio mux, so size_bytes is the final file size), or
+    from _write_loop's auto-stop branch when the encoder died on its own.
+    _session_meta is consumed here, so a second call for the same session
+    is a harmless no-op. Sessions that never started (writer failed to
+    open) never got a _session_meta and are not logged.
+    """
+    global _session_meta
+    with _state_lock:
+        meta = _session_meta
+        _session_meta = None
+    if meta is None:
+        return
+    size = 0
+    try:
+        if path is not None:
+            size = path.stat().st_size
+    except OSError:
+        pass  # zero-frame sessions produce no file; size stays 0
+    _session_log_append({
+        "start": meta["start_iso"],
+        "stop": datetime.now().isoformat(timespec="seconds"),
+        "duration_s": round(time.time() - meta["start_t"], 1),
+        "file": path.name if path is not None else None,
+        "size_bytes": size,
+        "audio": audio,
+    })
 
 
 def _safe_append(writer, frame: np.ndarray, path: Path) -> bool:
@@ -217,17 +293,25 @@ def _write_loop(path: Path, frames: "queue.Queue", ready: threading.Event) -> No
         # session state so the next toggle starts fresh instead of
         # "stopping" a dead session. Non-blocking: never stall the writer
         # thread on the state lock.
+        audio = False
+        auto_stopped = False
         if _state_lock.acquire(blocking=False):
             try:
                 if _session_thread is threading.current_thread():
                     _session_thread = None
                     _frames = None
                     _session_path = None
+                    audio = _audio_seg is not None
                     if _recording:
                         _recording = False
                         _log(f"{path.name}: encoder failed; recording auto-stopped")
+                    auto_stopped = True
             finally:
                 _state_lock.release()
+        if auto_stopped:
+            # The session ended without _end_session ever running, so this
+            # is the only place its sessions.jsonl entry can be written.
+            _record_session_entry(path, audio)
 
 
 # ----------------------------- AUDIO ----------------------------------
@@ -326,20 +410,22 @@ def _stop_audio_capture() -> None:
             _log("WARNING: audio thread still alive after 5s; abandoning it")
 
 
-def _mux_audio(video: Path, wav: Path, delay: float) -> None:
+def _mux_audio(video: Path, wav: Path, delay: float) -> bool:
     """Mux the session's audio WAV into its MP4 (video copied, audio AAC).
 
     On any failure the video is left untouched and the WAV is kept as a
     sidecar -- audio must never cost Alex his video.
+    Returns True when an audio track survived somewhere (in the MP4 or as
+    a sidecar), False when nothing usable was captured.
     """
     try:
         size = wav.stat().st_size
     except OSError:
-        return  # nothing captured; nothing to mux
+        return False  # nothing captured; nothing to mux
     if size < 4096:  # header plus essentially no samples
         _log(f"audio track {wav.name} too short ({size} B); keeping video only")
         _discard_wav(wav, "no usable audio captured")
-        return
+        return False
     try:
         import imageio_ffmpeg  # noqa: PLC0415 - already a hard dependency
         exe = imageio_ffmpeg.get_ffmpeg_exe()
@@ -349,7 +435,7 @@ def _mux_audio(video: Path, wav: Path, delay: float) -> None:
             wav.rename(video.with_name(video.stem + "_audio.wav"))
         except OSError:
             pass
-        return
+        return True
     out = video.with_name(video.stem + "_mux.mp4")
     cmd = [exe, "-y", "-v", "error", "-i", str(video)]
     if delay > 0.05:
@@ -373,13 +459,15 @@ def _mux_audio(video: Path, wav: Path, delay: float) -> None:
             wav.rename(video.with_name(video.stem + "_audio.wav"))
         except OSError:
             pass
-        return
+        return True
     try:
         os.replace(out, video)  # atomic: the MP4 name never changes
         wav.unlink()
         _log(f"audio muxed into {video.name} (offset {delay:.2f}s)")
+        return True
     except OSError as e:
         _log(f"mux finalize failed ({e}); files left: {video.name}, {out.name}")
+        return True
 
 
 def toggle_audio() -> None:
@@ -424,7 +512,7 @@ def _start_session() -> bool:
     False and leaves no session behind (so toggle() can reset cleanly).
     Must be called with _state_lock held.
     """
-    global _frames, _session_thread, _session_path, _session_start_t
+    global _frames, _session_thread, _session_path, _session_start_t, _session_meta
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     path = OUTPUT_DIR / f"ghost_{ts}.mp4"
     n = 1
@@ -449,6 +537,8 @@ def _start_session() -> bool:
     _session_thread = thread
     _session_path = path
     _session_start_t = time.time()
+    _session_meta = {"start_iso": datetime.now().isoformat(timespec="seconds"),
+                     "start_t": _session_start_t}
     _wake.set()
     _log(f"recording started -> {path.name}")
     return True
@@ -502,8 +592,10 @@ def _end_session(timeout: float = 15.0) -> None:
     if thread.is_alive():
         _log(f"WARNING: encoder for {path.name} still alive after "
              f"{timeout:.0f}s; left to finish its own file")
-    if audio_seg is not None:
-        _mux_audio(path, audio_seg[0], audio_seg[1])
+    audio_kept = _mux_audio(path, audio_seg[0], audio_seg[1]) if audio_seg is not None else False
+    # The mux ran after the encoder finalized the file, so size_bytes below
+    # is the final on-disk size (including the audio track, if any).
+    _record_session_entry(path, audio_kept)
 
 
 def toggle() -> None:

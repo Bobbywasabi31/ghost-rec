@@ -10,4 +10,5 @@ venv/
 *.mp4
 *.wav
 ghost.log
+sessions.jsonl
 audio.enabled

@@ -38,6 +38,26 @@ Videos land in `%USERPROFILE%\Videos\ghost\` as
 `ghost_YYYY-MM-DD_HH-MM-SS.mp4`. A small `ghost.log` there records
 start/stop times only.
 
+## Session log
+
+Every finished session appends one JSON object to
+`%USERPROFILE%\Videos\ghost\sessions.jsonl` (one per line), e.g.
+
+```json
+{"start": "2026-10-09T21:14:02", "stop": "2026-10-09T21:16:47", "duration_s": 165.2, "file": "ghost_2026-10-09_21-14-02.mp4", "size_bytes": 48210311, "audio": false}
+```
+
+Fields: local start/stop timestamps (ISO-8601, no timezone suffix),
+duration in seconds, the MP4 file name, its final size in bytes
+(`0` when the session produced no file), and whether an audio track
+was captured for the session (`true` only when audio actually made it
+into the file or a sidecar — a failed/empty capture logs `false`).
+
+The log is local-only, append-only, and never leaves the machine —
+it exists so you can review what got recorded and when. It keeps the
+newest 5000 sessions; older lines are dropped automatically (atomic
+rewrite, no half-file states).
+
 ## Audio (optional, off by default)
 
 `Ctrl+Shift+A` toggles system-audio capture. It records **whatever plays

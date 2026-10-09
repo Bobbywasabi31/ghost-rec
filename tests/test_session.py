@@ -8,6 +8,7 @@ and the real session/mux/toggle logic; Windows-only paths (hotkeys,
 WASAPI, pythonw) remain Alex-machine territory per docs/.
 """
 
+import json
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,7 @@ def clean_state(monkeypatch):
     """Reset module-level session/audio state around each test."""
     for name in ("_recording", "_audio_enabled"):
         monkeypatch.setattr(ghost_rec, name, False)
+    monkeypatch.setattr(ghost_rec, "_session_meta", None)
     ghost_rec._quit.clear()
     yield
     ghost_rec._quit.clear()
@@ -178,3 +180,78 @@ def test_mux_failure_keeps_video_and_sidecar(outdir):
     sidecar = outdir / "v_audio.wav"
     assert sidecar.exists()  # audio must never cost the video
     assert video.read_bytes() == b"fake-video"
+
+
+# --- sessions.jsonl -------------------------------------------------------------
+
+
+def _read_session_log(outdir):
+    raw = (outdir / "sessions.jsonl").read_text(encoding="utf-8")
+    return [json.loads(line) for line in raw.splitlines()]
+
+
+def test_session_log_records_completed_session(outdir, clean_state):
+    ghost_rec.toggle()  # start
+    for _ in range(10):
+        ghost_rec._frames.put_nowait(_frame())
+    path = ghost_rec._session_path
+    ghost_rec.toggle()  # stop
+    (e,) = _read_session_log(outdir)
+    assert e["file"] == path.name
+    assert e["size_bytes"] == path.stat().st_size
+    assert e["size_bytes"] > 0
+    assert e["audio"] is False
+    assert e["duration_s"] >= 0
+    # Local ISO-8601 timestamps that round-trip and order correctly.
+    assert datetime.fromisoformat(e["start"]) <= datetime.fromisoformat(e["stop"])
+    assert set(e) == {"start", "stop", "duration_s", "file", "size_bytes", "audio"}
+
+
+def test_session_log_zero_frame_session(outdir, clean_state):
+    ghost_rec.toggle()  # start, push nothing
+    path = ghost_rec._session_path
+    ghost_rec.toggle()  # stop: no file, but the session is still logged
+    (e,) = _read_session_log(outdir)
+    assert e["file"] == path.name
+    assert e["size_bytes"] == 0
+    assert e["audio"] is False
+
+
+def test_session_log_audio_true_when_track_muxed(outdir, clean_state):
+    ghost_rec.toggle()  # start
+    for _ in range(10):
+        ghost_rec._frames.put_nowait(_frame())
+    path = ghost_rec._session_path
+    wav = outdir / "seg.wav"
+    _write_wav(wav, 1.0)
+    ghost_rec._audio_seg = (wav, 0.0)  # pretend a session's audio segment exists
+    ghost_rec.toggle()  # stop -> mux runs on real ffmpeg
+    (e,) = _read_session_log(outdir)
+    assert e["audio"] is True
+    assert not wav.exists()  # consumed by the mux
+    assert list(outdir.glob("*_audio.wav")) == []  # no sidecar: the mux worked
+
+
+def test_session_log_failed_start_writes_nothing(outdir, clean_state, monkeypatch):
+    # Writer never opens -> _start_session returns False -> no session, no entry.
+    monkeypatch.setattr(ghost_rec, "_start_session", lambda: False)
+    ghost_rec.toggle()
+    assert ghost_rec._recording is False
+    assert not (outdir / "sessions.jsonl").exists()
+
+
+def test_session_log_append_is_json_lines(outdir, clean_state):
+    ghost_rec._session_log_append({"a": 1})
+    ghost_rec._session_log_append({"b": 2})
+    raw = (outdir / "sessions.jsonl").read_text(encoding="utf-8")
+    assert raw.count("\n") == 2
+    assert [json.loads(line) for line in raw.splitlines()] == [{"a": 1}, {"b": 2}]
+
+
+def test_session_log_rotation(outdir, clean_state, monkeypatch):
+    monkeypatch.setattr(ghost_rec, "SESSION_LOG_MAX_LINES", 3)
+    for i in range(5):
+        ghost_rec._session_log_append({"n": i})
+    entries = _read_session_log(outdir)
+    assert [e["n"] for e in entries] == [2, 3, 4]  # oldest dropped, order kept
+    assert list(outdir.glob("*.tmp")) == []  # atomic rewrite left no temp file
