@@ -3,7 +3,7 @@
 Run:  pytest -q        (deps: pip install -r requirements.txt pytest)
 
 The stubs from conftest.py stand in for mss/keyboard/sounddevice, so these
-run headless on Linux CI. They exercise the real encoder (imageio-ffmpeg)
+run headless on Linux and Windows CI. They exercise the real encoder (imageio-ffmpeg)
 and the real session/mux/toggle logic; Windows-only paths (hotkeys,
 WASAPI, pythonw) remain Alex-machine territory per docs/.
 """

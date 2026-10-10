@@ -6,7 +6,13 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      # ghost-rec targets Windows, so the stub-based logic tests run on the
+      # real target platform too — conftest.py stubs mss/keyboard/sounddevice,
+      # which keeps the job headless and hardware-free on both runners.
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,6 +26,7 @@ jobs:
         run: python -m py_compile ghost_rec.py
       - name: Run logic tests
         # Headless-safe: conftest.py stubs mss/keyboard/sounddevice, so this
-        # exercises the real session/mux/toggle logic against a fake screen.
-        # Hotkeys, WASAPI audio and pythonw behaviour need a Windows machine.
+        # exercises the real session/mux/toggle logic against a fake screen on
+        # both Linux and Windows runners. Hotkeys, WASAPI audio and pythonw
+        # behaviour need a Windows machine (see docs/).
         run: pytest -q

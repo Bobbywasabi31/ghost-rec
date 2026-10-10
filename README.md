@@ -76,7 +76,8 @@ session just records video — your video is never at risk.
 
 ## Tests
 
-`tests/` runs the session/mux/toggle logic headless on Linux CI: stub
+`tests/` runs the session/mux/toggle logic headless on Linux and Windows CI
+(the matrix covers both; it targets Windows): stub
 modules stand in for `mss`, `keyboard`, and `sounddevice` (which reports
 no WASAPI, like any non-Windows host), and the real encoder
 (imageio-ffmpeg) validates the MP4s. Hotkeys, real WASAPI capture, and
