@@ -58,6 +58,14 @@ it exists so you can review what got recorded and when. It keeps the
 newest 5000 sessions; older lines are dropped automatically (atomic
 rewrite, no half-file states).
 
+`sessions_summary.py` (stdlib only) prints a one-page summary of the log:
+
+```
+python sessions_summary.py                # default log location above
+python sessions_summary.py --log path\to\sessions.jsonl
+python sessions_summary.py --json         # machine-readable JSON
+```
+
 ## Audio (optional, off by default)
 
 `Ctrl+Shift+A` toggles system-audio capture. It records **whatever plays
