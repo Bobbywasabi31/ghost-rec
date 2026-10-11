@@ -9,6 +9,7 @@ WASAPI, pythonw) remain Alex-machine territory per docs/.
 """
 
 import json
+import time
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -83,6 +84,51 @@ def test_toggle_cycle_produces_valid_mp4(outdir, clean_state):
     assert path.stat().st_size > 0
     assert _decode_frame_count(path) >= 5  # encoder may merge, never invent
     assert path.name in (p.name for p in outdir.glob("ghost_*.mp4"))
+
+
+def _video_duration_s(path: Path) -> float:
+    with imageio.get_reader(str(path)) as reader:
+        meta = reader.get_meta_data()
+        return sum(1 for _ in reader) / meta["fps"]
+
+
+def test_write_loop_pads_slow_capture_to_wall_time(outdir, clean_state, monkeypatch):
+    """Slow grabber must not produce a sped-up video.
+
+    Regression test for the "both video and speed" bug report: the encoder
+    stamps every emitted frame 1/FPS apart, so emitting one frame per grab
+    on a machine too slow to sustain FPS played back faster than real
+    time. The writer now pads with duplicates of the last frame to track
+    wall-clock time: slow capture freezes instead of speeding up.
+    """
+    monkeypatch.setattr(ghost_rec, "FPS", 10)  # small numbers, fast test
+    ghost_rec.toggle()  # start session
+    path = ghost_rec._session_path
+    # Simulate a grabber sustaining ~2 fps for ~1.5 s of wall time.
+    n = 0
+    t_end = time.perf_counter() + 1.5
+    while time.perf_counter() < t_end:
+        ghost_rec._frames.put_nowait(_frame())
+        n += 1
+        time.sleep(0.5)
+    ghost_rec.toggle()  # stop
+    duration = _video_duration_s(path)
+    assert n <= 4, n  # only a handful of real frames arrived...
+    assert duration >= 1.2, (duration, n)  # ...but the video covers wall time
+    assert duration <= 2.5, (duration, n)  # padded, not runaway
+
+
+def test_write_loop_no_padding_when_on_pace(outdir, clean_state, monkeypatch):
+    """Frames arriving at the FPS pace must not gain invented extras."""
+    monkeypatch.setattr(ghost_rec, "FPS", 10)
+    ghost_rec.toggle()
+    path = ghost_rec._session_path
+    for _ in range(10):
+        ghost_rec._frames.put_nowait(_frame())
+        time.sleep(0.1)  # exactly the 1/FPS pace
+    ghost_rec.toggle()
+    count = _decode_frame_count(path)
+    assert 10 <= count <= 14, count  # ~10 real + tiny jitter pad, not runaway
 
 
 def test_filename_collision_bumps_to_2(outdir, clean_state):

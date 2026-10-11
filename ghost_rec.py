@@ -20,10 +20,12 @@ A tiny ghost.log in the same folder records start/stop times (no content),
 and sessions.jsonl keeps one JSON line per finished session (timestamps,
 duration, file name, size, audio on/off) for your own review.
 
-Reliability notes (logic audit 2026-10-08):
-- The capture loop is paced to FPS: every appended frame is stamped
-  1/FPS apart, so grabbing must not run faster than FPS or the video
-  plays back sped up. Slow machines drop frames instead of lagging.
+Reliability notes (logic audit 2026-10-08; pacing fix 2026-10-11):
+- The capture loop never runs faster than FPS, and the writer pads with
+  duplicates of the last frame so the emitted frame count tracks
+  wall-clock time. Every emitted frame is stamped 1/FPS apart, so on a
+  slow machine (4K screen, busy CPU) the video briefly freezes instead of
+  playing back faster than real time.
 - Each session gets its own frame queue and a stop sentinel, so ending
   one session and starting the next can never mix frames between files,
   even if the encoder is still flushing the old one.
@@ -191,7 +193,11 @@ def _safe_append(writer, frame: np.ndarray, path: Path) -> bool:
 
 
 def _grab_loop() -> None:
-    """Capture frames paced to FPS; drop rather than lag.
+    """Capture frames at up to FPS; drop rather than lag.
+
+    Only the fast side needs pacing here (see the sleep below): when the
+    machine is too slow to sustain FPS, the writer pads with duplicates
+    to keep the video locked to wall-clock time (see _write_loop).
 
     Raises on failure so the supervisor can restart it -- this must never
     die quietly mid-session.
@@ -250,6 +256,15 @@ def _write_loop(path: Path, frames: "queue.Queue", ready: threading.Event) -> No
     while this one is still flushing, no frame can cross between files.
     Exits only on the sentinel (posted by _end_session) or encoder failure,
     so every queued frame is written before the file is finalized.
+
+    Wall-clock pacing: the encoder stamps every emitted frame 1/FPS apart,
+    so the file's duration is (frames emitted)/FPS. The grab loop never
+    runs faster than FPS, but on a slow machine (4K screen, busy CPU) it
+    runs slower -- emitting one frame per grab would then make the video
+    play back FASTER than real time (bug report: "both video and speed").
+    Instead the writer pads with duplicates of the last frame to keep the
+    emitted count tracking wall time: slow capture shows as a brief
+    freeze, never a sped-up video.
     """
     global _session_thread, _frames, _session_path, _recording
     try:
@@ -265,6 +280,40 @@ def _write_loop(path: Path, frames: "queue.Queue", ready: threading.Event) -> No
         _log(f"could not open writer for {path.name}: {e}; session aborted")
         return
     ready.set()  # writer is open; the session may now accept frames
+
+    t_start = time.perf_counter()
+    emitted = 0
+    last_frame: "np.ndarray | None" = None
+
+    def _pad_to_now() -> bool:
+        """Duplicate the last frame until the emitted count reaches the
+        frame count wall-clock time says should exist by now."""
+        nonlocal emitted
+        if last_frame is None:
+            return True  # nothing real emitted yet; nothing to duplicate
+        due = int((time.perf_counter() - t_start) * FPS)
+        pad = due - emitted
+        if pad > FPS * 60:
+            _log(f"{path.name}: capture stalled, capping catch-up padding at 60s")
+            pad = FPS * 60
+        for _ in range(max(0, pad)):
+            if not _safe_append(writer, last_frame, path):
+                return False
+            emitted += 1
+        return True
+
+    def _append_padded(frame: "np.ndarray") -> bool:
+        """Append `frame`, first padding with duplicates of the previous
+        frame so the emitted frame count tracks wall-clock time."""
+        nonlocal emitted, last_frame
+        if not _pad_to_now():
+            return False
+        if not _safe_append(writer, frame, path):
+            return False
+        emitted += 1
+        last_frame = frame
+        return True
+
     try:
         with writer:
             ok = True
@@ -274,9 +323,12 @@ def _write_loop(path: Path, frames: "queue.Queue", ready: threading.Event) -> No
                 except queue.Empty:
                     continue  # session still open, just no frames yet
                 if frame is _SENTINEL:
-                    # Drain stragglers grabbed concurrently with the stop.
+                    # Pad to wall-clock time first so the file's duration
+                    # covers the session right up to the stop, then drain
+                    # stragglers grabbed concurrently with the stop.
                     # Nothing new can arrive: _frames was swapped to None
                     # before the sentinel was posted.
+                    ok = _pad_to_now()
                     while ok:
                         try:
                             extra = frames.get_nowait()
@@ -284,9 +336,9 @@ def _write_loop(path: Path, frames: "queue.Queue", ready: threading.Event) -> No
                             break
                         if extra is _SENTINEL:
                             continue
-                        ok = _safe_append(writer, extra, path)
+                        ok = _append_padded(extra)
                     break
-                ok = _safe_append(writer, frame, path)
+                ok = _append_padded(frame)
     finally:
         _log(f"saved {path.name}")
         # If the encoder died on its own (not via _end_session), clear the
