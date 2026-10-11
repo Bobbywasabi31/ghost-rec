@@ -10,7 +10,11 @@ Stdlib only -- runs anywhere, including a bare Windows box:
     python sessions_summary.py                # default: ~/Videos/ghost/sessions.jsonl
     python sessions_summary.py --log out/sessions.jsonl
     python sessions_summary.py --json         # machine-readable summary
+    python sessions_summary.py --csv          # spreadsheet-friendly CSV
     python sessions_summary.py --from 2026-10-01 --to 2026-10-10  # date range
+
+Notes (log path, skipped lines, active filters) go to stderr under --csv so
+stdout stays pure CSV; --json and --csv cannot be combined.
 
 Bad lines (corrupt JSON, missing fields) are skipped and counted, never
 fatal: the log is a personal review aid, not a database.
@@ -19,6 +23,8 @@ fatal: the log is a personal review aid, not a database.
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import sys
 from collections import defaultdict
@@ -164,6 +170,32 @@ def summarize(entries: list[dict]) -> dict:
     }
 
 
+def format_csv(summary: dict) -> str:
+    """Render the summary as a uniform section,key,value CSV.
+
+    One header row, then one row per metric: the four summary scalars, the
+    largest-file rows (only when a file is recorded), and two rows per day
+    (sessions, duration_s), days sorted ascending. Durations are the rounded
+    summary values (one decimal); byte counts are ints -- plain decimals so
+    spreadsheets and pandas parse them cleanly. stdlib csv handles quoting.
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["section", "key", "value"])
+    writer.writerow(["summary", "sessions", summary["sessions"]])
+    writer.writerow(["summary", "total_duration_s", summary["total_duration_s"]])
+    writer.writerow(["summary", "total_bytes", summary["total_bytes"]])
+    writer.writerow(["summary", "audio_sessions", summary["audio_sessions"]])
+    largest = summary["largest"]
+    if largest and largest["file"]:
+        writer.writerow(["summary", "largest_file", largest["file"]])
+        writer.writerow(["summary", "largest_size_bytes", largest["size_bytes"]])
+    for day, d in summary["days"].items():
+        writer.writerow(["day_sessions", day, d["sessions"]])
+        writer.writerow(["day_duration_s", day, d["duration_s"]])
+    return buf.getvalue()
+
+
 def format_text(summary: dict, log_path: Path, skipped: int,
                 date_from=None, date_to=None,
                 out_of_range: int = 0, undated_excluded: int = 0) -> str:
@@ -220,6 +252,11 @@ def main(argv: list[str] | None = None) -> int:
         help="print the summary as JSON instead of text",
     )
     parser.add_argument(
+        "--csv",
+        action="store_true",
+        help="print the summary as CSV (notes go to stderr so stdout stays pure)",
+    )
+    parser.add_argument(
         "--from",
         dest="date_from",
         default=None,
@@ -234,6 +271,9 @@ def main(argv: list[str] | None = None) -> int:
         help="only include sessions starting on or before this day",
     )
     args = parser.parse_args(argv)
+
+    if args.json and args.csv:
+        parser.error("--json and --csv cannot be combined")
 
     date_from = date_to = None
     if args.date_from or args.date_to:
@@ -262,6 +302,22 @@ def main(argv: list[str] | None = None) -> int:
         }
         json.dump(payload, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
+    elif args.csv:
+        sys.stdout.write(format_csv(summary))
+        notes = [f"log: {args.log}"]
+        if date_from is not None or date_to is not None:
+            lo = date_from.isoformat() if date_from else "beginning"
+            hi = date_to.isoformat() if date_to else "end"
+            notes.append(f"range: {lo} -> {hi}")
+        if skipped:
+            notes.append(f"skipped {skipped} unreadable line(s)")
+        if out_of_range:
+            notes.append(f"excluded {out_of_range} session(s) outside the range")
+        if undated_excluded:
+            notes.append(
+                f"excluded {undated_excluded} session(s) with no usable date"
+            )
+        sys.stderr.write("\n".join(notes) + "\n")
     else:
         sys.stdout.write(
             format_text(

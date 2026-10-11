@@ -64,12 +64,19 @@ rewrite, no half-file states).
 python sessions_summary.py                # default log location above
 python sessions_summary.py --log path\to\sessions.jsonl
 python sessions_summary.py --json         # machine-readable JSON
+python sessions_summary.py --csv          # spreadsheet-friendly CSV
 python sessions_summary.py --from 2026-10-01 --to 2026-10-10   # date range
 ```
 
 `--from`/`--to` take `YYYY-MM-DD` (inclusive); garbage dates or `--from`
 after `--to` exit with a usage error. Undated entries are excluded whenever
 a range is set, and the report (or `--json`) notes what was excluded.
+
+Under `--csv`, stdout is pure CSV (header `section,key,value`, with
+`summary`, `largest`, and per-day `day_sessions`/`day_duration_s` rows), so
+it pipes straight into a spreadsheet or pandas; log path, skipped lines,
+and filter notes go to stderr instead. `--json` and `--csv` cannot be
+combined.
 
 ## Audio (optional, off by default)
 
