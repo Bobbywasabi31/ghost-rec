@@ -6,6 +6,8 @@ Stdlib-only module, so these run on the Ubuntu + Windows CI matrix with no
 headless-stub machinery needed.
 """
 
+from datetime import date, timedelta
+
 import csv
 import io
 import json
@@ -335,3 +337,82 @@ def test_main_csv_and_json_conflict_exits_2(tmp_path, capsys):
         sessions_summary.main(["--log", str(log), "--json", "--csv"])
     assert excinfo.value.code == 2
     assert "cannot be combined" in capsys.readouterr().err
+
+
+def test_resolve_days_range_window():
+    fake_today = date(2026, 10, 11)
+    assert sessions_summary.resolve_days_range("1", fake_today) == (
+        fake_today, fake_today,
+    )
+    assert sessions_summary.resolve_days_range("7", fake_today) == (
+        fake_today - timedelta(days=6), fake_today,
+    )
+
+
+@pytest.mark.parametrize("bad", ["0", "-3", "abc", "2.5", ""])
+def test_resolve_days_range_rejects_garbage(bad):
+    with pytest.raises(ValueError):
+        sessions_summary.resolve_days_range(bad, date(2026, 10, 11))
+
+
+def dated_entry(days_ago, **kwargs):
+    start = (date.today() - timedelta(days=days_ago)).isoformat() + "T10:00:00"
+    return entry(start=start, **kwargs)
+
+
+def test_main_days_keeps_last_n_days(tmp_path, capsys):
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [
+        dated_entry(0, file="today.mp4"),
+        dated_entry(6, file="six-ago.mp4"),
+        dated_entry(8, file="eight-ago.mp4"),
+        '{"duration_s": 5.0}',  # undated, excluded while filtering
+    ])
+    assert sessions_summary.main(["--log", str(log), "--days", "7"]) == 0
+    out = capsys.readouterr().out
+    lo = (date.today() - timedelta(days=6)).isoformat()
+    hi = date.today().isoformat()
+    assert f"Range: {lo} -> {hi}" in out
+    assert "Sessions: 2" in out
+    assert "(excluded 1 session(s) outside the range)" in out
+    assert "(excluded 1 session(s) with no usable date)" in out
+
+
+def test_main_from_overrides_days_bound(tmp_path, capsys):
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [
+        dated_entry(0, file="today.mp4"),
+        dated_entry(1, file="yesterday.mp4"),
+        dated_entry(6, file="six-ago.mp4"),
+    ])
+    # --from sets the lower bound; --days still supplies today as the upper
+    args = ["--log", str(log), "--days", "7",
+            "--from", (date.today() - timedelta(days=1)).isoformat()]
+    assert sessions_summary.main(args) == 0
+    out = capsys.readouterr().out
+    assert "Sessions: 2" in out
+    assert "(excluded 1 session(s) outside the range)" in out
+
+
+def test_main_days_json_reports_resolved_bounds(tmp_path, capsys):
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [dated_entry(0)])
+    assert sessions_summary.main(["--log", str(log), "--json", "--days", "3"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["sessions"] == 1
+    assert payload["date_from"] == (date.today() - timedelta(days=2)).isoformat()
+    assert payload["date_to"] == date.today().isoformat()
+
+
+@pytest.mark.parametrize("args", [
+    ["--days", "abc"],
+    ["--days", "0"],
+    ["--days", "-5"],
+])
+def test_main_bad_days_exits_2(tmp_path, capsys, args):
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [entry()])
+    with pytest.raises(SystemExit) as excinfo:
+        sessions_summary.main(["--log", str(log)] + args)
+    assert excinfo.value.code == 2
+    assert "positive integer" in capsys.readouterr().err

@@ -12,6 +12,7 @@ Stdlib only -- runs anywhere, including a bare Windows box:
     python sessions_summary.py --json         # machine-readable summary
     python sessions_summary.py --csv          # spreadsheet-friendly CSV
     python sessions_summary.py --from 2026-10-01 --to 2026-10-10  # date range
+    python sessions_summary.py --days 7  # shorthand: last 7 days incl. today
 
 Notes (log path, skipped lines, active filters) go to stderr under --csv so
 stdout stays pure CSV; --json and --csv cannot be combined.
@@ -28,7 +29,7 @@ import io
 import json
 import sys
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 DEFAULT_LOG = Path.home() / "Videos" / "ghost" / "sessions.jsonl"
@@ -90,6 +91,23 @@ def _parse_day(value: str):
         return datetime.strptime(value, "%Y-%m-%d").date()
     except ValueError:
         raise ValueError(f"bad date {value!r}: expected YYYY-MM-DD") from None
+
+
+def resolve_days_range(value: str, today: date | None = None):
+    """Map a --days N argument to the last-N-days-including-today window.
+
+    Returns (date_from, date_to); --days 1 covers today only. Raises
+    ValueError with a friendly message for anything that is not a positive
+    integer. *today* is injectable so tests don't depend on the calendar.
+    """
+    today = today or date.today()
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"bad --days {value!r}: expected a positive integer") from None
+    if days < 1:
+        raise ValueError(f"bad --days {value!r}: expected a positive integer")
+    return today - timedelta(days=days - 1), today
 
 
 def filter_entries_by_date(entries: list[dict], date_from=None, date_to=None):
@@ -270,20 +288,37 @@ def main(argv: list[str] | None = None) -> int:
         metavar="YYYY-MM-DD",
         help="only include sessions starting on or before this day",
     )
+    parser.add_argument(
+        "--days",
+        default=None,
+        metavar="N",
+        help=("shorthand for the last N days including today; fills any bound "
+              "that --from/--to doesn't set"),
+    )
     args = parser.parse_args(argv)
 
     if args.json and args.csv:
         parser.error("--json and --csv cannot be combined")
 
-    date_from = date_to = None
-    if args.date_from or args.date_to:
+    # --days supplies defaults; explicit --from/--to override whichever
+    # bound they name, so e.g. --from 2026-10-01 --days 30 reads that day
+    # through today.
+    days_from = days_to = None
+    if args.days is not None:
         try:
-            date_from = _parse_day(args.date_from) if args.date_from else None
-            date_to = _parse_day(args.date_to) if args.date_to else None
+            days_from, days_to = resolve_days_range(args.days)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    date_from = date_to = None
+    if args.date_from or args.date_to or days_from is not None:
+        try:
+            date_from = _parse_day(args.date_from) if args.date_from else days_from
+            date_to = _parse_day(args.date_to) if args.date_to else days_to
         except ValueError as exc:
             parser.error(str(exc))
         if date_from and date_to and date_from > date_to:
-            parser.error(f"--from {args.date_from} is after --to {args.date_to}")
+            parser.error(f"--from {date_from} is after --to {date_to}")
 
     entries, skipped = load_entries(args.log)
     entries, out_of_range, undated_excluded = filter_entries_by_date(

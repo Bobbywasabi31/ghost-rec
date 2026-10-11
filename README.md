@@ -66,10 +66,14 @@ python sessions_summary.py --log path\to\sessions.jsonl
 python sessions_summary.py --json         # machine-readable JSON
 python sessions_summary.py --csv          # spreadsheet-friendly CSV
 python sessions_summary.py --from 2026-10-01 --to 2026-10-10   # date range
+python sessions_summary.py --days 7       # last 7 days including today
 ```
 
 `--from`/`--to` take `YYYY-MM-DD` (inclusive); garbage dates or `--from`
-after `--to` exit with a usage error. Undated entries are excluded whenever
+after `--to` exit with a usage error. `--days N` is shorthand for the last
+N days including today (N ≥ 1; garbage exits 2) and just fills whichever
+bound an explicit `--from`/`--to` doesn't set, so `--from 2026-10-01
+--days 30` reads that day through today. Undated entries are excluded whenever
 a range is set, and the report (or `--json`) notes what was excluded.
 
 Under `--csv`, stdout is pure CSV (header `section,key,value`, with
