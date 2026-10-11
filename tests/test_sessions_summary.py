@@ -127,6 +127,108 @@ def test_main_missing_log_is_not_an_error(tmp_path, capsys):
     assert "Sessions: 0" in capsys.readouterr().out
 
 
+def test_filter_entries_by_date_inclusive_bounds():
+    entries = [
+        json.loads(entry(start="2026-10-08T10:00:00")),  # before range
+        json.loads(entry(start="2026-10-09T10:00:00")),  # on --from
+        json.loads(entry(start="2026-10-10T09:00:00")),  # on --to
+        json.loads(entry(start="2026-10-11T09:00:00")),  # after range
+        json.loads('{"duration_s": 5.0}'),  # no date at all
+    ]
+    kept, out_of_range, undated = sessions_summary.filter_entries_by_date(
+        entries,
+        sessions_summary._parse_day("2026-10-09"),
+        sessions_summary._parse_day("2026-10-10"),
+    )
+    assert [e["start"] for e in kept] == ["2026-10-09T10:00:00", "2026-10-10T09:00:00"]
+    assert out_of_range == 2
+    assert undated == 1
+
+
+def test_filter_entries_by_date_no_bounds_keeps_everything():
+    entries = [json.loads(entry()), json.loads('{"duration_s": 5.0}')]
+    kept, out_of_range, undated = sessions_summary.filter_entries_by_date(entries)
+    assert len(kept) == 2
+    assert (out_of_range, undated) == (0, 0)
+
+
+def test_filter_entries_by_date_one_sided_bounds():
+    entries = [
+        json.loads(entry(start="2026-10-08T10:00:00")),
+        json.loads(entry(start="2026-10-10T09:00:00")),
+    ]
+    kept, _, _ = sessions_summary.filter_entries_by_date(
+        entries, date_to=sessions_summary._parse_day("2026-10-08")
+    )
+    assert [e["start"] for e in kept] == ["2026-10-08T10:00:00"]
+    kept, _, _ = sessions_summary.filter_entries_by_date(
+        entries, date_from=sessions_summary._parse_day("2026-10-10")
+    )
+    assert [e["start"] for e in kept] == ["2026-10-10T09:00:00"]
+
+
+def test_parse_day_rejects_garbage():
+    with pytest.raises(ValueError):
+        sessions_summary._parse_day("october 9")
+
+
+def test_main_from_to_text(tmp_path, capsys):
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [
+        entry(start="2026-10-08T10:00:00", file="a.mp4"),
+        entry(start="2026-10-09T10:00:00", file="b.mp4"),
+        entry(start="2026-10-10T09:00:00", file="c.mp4"),
+        '{"duration_s": 5.0}',  # undated, excluded while filtering
+    ])
+    args = ["--log", str(log), "--from", "2026-10-09", "--to", "2026-10-10"]
+    assert sessions_summary.main(args) == 0
+    out = capsys.readouterr().out
+    assert "Range: 2026-10-09 -> 2026-10-10" in out
+    assert "Sessions: 2" in out
+    assert "2026-10-09: 1 session(s)" in out
+    assert "(excluded 1 session(s) outside the range)" in out
+    assert "(excluded 1 session(s) with no usable date)" in out
+
+
+def test_main_from_to_json(tmp_path, capsys):
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [
+        entry(start="2026-10-08T10:00:00", file="a.mp4"),
+        entry(start="2026-10-09T10:00:00", file="b.mp4"),
+    ])
+    args = ["--log", str(log), "--json", "--from", "2026-10-09"]
+    assert sessions_summary.main(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["sessions"] == 1
+    assert payload["date_from"] == "2026-10-09"
+    assert payload["date_to"] is None
+    assert payload["out_of_range"] == 1
+    assert payload["undated_excluded"] == 0
+
+
+def test_main_no_range_json_has_null_bounds(tmp_path, capsys):
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [entry()])
+    assert sessions_summary.main(["--log", str(log), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["date_from"] is None and payload["date_to"] is None
+    assert payload["out_of_range"] == 0 and payload["undated_excluded"] == 0
+
+
+@pytest.mark.parametrize("args", [
+    ["--from", "not-a-date"],
+    ["--to", "2026-13-40"],
+    ["--from", "2026-10-10", "--to", "2026-10-09"],  # from > to
+])
+def test_main_bad_range_exits_2(tmp_path, capsys, args):
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [entry()])
+    with pytest.raises(SystemExit) as excinfo:
+        sessions_summary.main(["--log", str(log)] + args)
+    assert excinfo.value.code == 2
+    assert "YYYY-MM-DD" in capsys.readouterr().err or "after" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("seconds,expected", [
     (0, "0s"), (59, "59s"), (61, "1m 1s"), (3600, "1h 0m 0s"),
     (3661, "1h 1m 1s"),
