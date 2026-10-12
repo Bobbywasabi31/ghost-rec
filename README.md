@@ -104,6 +104,30 @@ so short sessions don't false-positive. Exit code is 1 when any session
 drifted, 0 when everything is within tolerance (or nothing was checkable),
 2 on a usage error.
 
+`retime_clip.py` (issue #1 follow-up) *repairs* a clip that
+`check_playback.py` flagged: it re-times the video stream back to the
+wall-clock capture span so the clip plays at real-time speed again. The
+target duration comes from `sessions.jsonl` (matched by file name) unless
+`--duration` is given explicitly. The video is re-encoded with stretched
+timestamps (frames held as needed at 60fps); any audio track is already
+in real time, so it is copied untouched — which also restores A/V sync.
+The input file is never modified; the repaired clip lands next to it as
+`<name>.retimed.mp4` unless `--output` says otherwise.
+
+```
+python retime_clip.py ghost_2026-10-11_12-40-01.mp4
+python retime_clip.py clip.mp4 --duration 300
+python retime_clip.py clip.mp4 --output fixed.mp4
+python retime_clip.py clip.mp4 --dry-run      # print the ffmpeg command
+python retime_clip.py clip.mp4 --force        # overwrite output / allow extreme stretch
+```
+
+Safety rails: refuses to write over the input or an existing output
+without `--force`; does nothing when the clip already plays at real time
+(same 10%/2s tolerance as `check_playback`); and treats a stretch factor
+beyond 120x as a probable bad log entry, requiring `--force`. Exit code
+is 1 when the clip can't be probed or ffmpeg fails, 2 on a usage error.
+
 ## Audio (optional, off by default)
 
 `Ctrl+Shift+A` toggles system-audio capture. It records **whatever plays
