@@ -220,7 +220,9 @@ def test_format_text_summary_counts():
         {"file": "a.mp4", "duration_s": 60.0, "video_s": 60.0,
          "status": "OK", "note": ""},
         {"file": "b.mp4", "duration_s": 60.0, "video_s": 2.0,
-         "status": "SPED_UP", "note": "video is 2.0s for 60.0s of capture"},
+         "status": "SPED_UP",
+         "note": "video is 2.0s for 60.0s of capture "
+                 "(3% of real time) -- sped-up playback"},
     ]
     text = check_playback.format_text(rows, Path("sessions.jsonl"), skipped=1)
     assert "2 session(s) checked: 1 drifted, 1 ok" in text
