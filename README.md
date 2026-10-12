@@ -82,6 +82,28 @@ it pipes straight into a spreadsheet or pandas; log path, skipped lines,
 and filter notes go to stderr instead. `--json` and `--csv` cannot be
 combined.
 
+`check_playback.py` (issue #1 follow-up) verifies each clip actually plays
+back at real-time speed: it probes every MP4's encoded duration with the
+bundled ffmpeg (no frame decoding) and compares it against the wall-clock
+`duration_s` in the log. Sessions whose video is much shorter than the
+logged capture span — the sped-up-playback symptom — are flagged
+`SPED_UP`; much longer is `STRETCHED`; missing or unreadable files are
+reported, never fatal:
+
+```
+python check_playback.py                  # default log location above
+python check_playback.py --log path\to\sessions.jsonl
+python check_playback.py --video-dir path\to\clips   # MP4s live elsewhere
+python check_playback.py --tolerance 5    # relative drift tolerance, percent
+python check_playback.py --json           # machine-readable report
+```
+
+MP4s are assumed to sit next to the log file unless `--video-dir` says
+otherwise. Drift tolerance defaults to 10% with a 2-second absolute floor
+so short sessions don't false-positive. Exit code is 1 when any session
+drifted, 0 when everything is within tolerance (or nothing was checkable),
+2 on a usage error.
+
 ## Audio (optional, off by default)
 
 `Ctrl+Shift+A` toggles system-audio capture. It records **whatever plays

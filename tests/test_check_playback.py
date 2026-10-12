@@ -1,0 +1,228 @@
+"""Logic tests for check_playback.py (issue #1 follow-up).
+
+Run:  pytest -q
+
+Drift math and ffmpeg-output parsing are hermetic (canned probes / canned
+ffmpeg stderr). One end-to-end test writes real MP4s with imageio and runs
+main() against them, so the whole log->probe->verdict path is exercised on
+both CI runners (imageio + imageio-ffmpeg are ghost-rec dependencies).
+"""
+
+import io
+import json
+from contextlib import redirect_stdout
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+import pytest
+
+import check_playback
+
+
+def entry(file="clip.mp4", duration=60.0):
+    return {
+        "start": "2026-10-11T12:00:00",
+        "stop": "2026-10-11T12:01:00",
+        "duration_s": duration,
+        "file": file,
+        "size_bytes": 1024,
+        "audio": False,
+    }
+
+
+def canned_probe(seconds):
+    def probe(path):
+        return seconds
+    return probe
+
+
+def touch(path: Path):
+    path.write_bytes(b"\x00")  # exists, contents never read (probe is canned)
+
+
+# --- drift math -----------------------------------------------------------
+
+def test_ok_within_tolerance(tmp_path):
+    touch(tmp_path / "clip.mp4")
+    row = check_playback.check_entry(entry(duration=60.0), tmp_path,
+                                     probe=canned_probe(57.0))
+    assert row["status"] == "OK"
+    assert row["video_s"] == 57.0
+
+
+def test_sped_up_is_the_issue1_shape(tmp_path):
+    # Alex's issue #1: minutes of screen time squeezed into seconds of video.
+    touch(tmp_path / "clip.mp4")
+    row = check_playback.check_entry(entry(duration=240.0), tmp_path,
+                                     probe=canned_probe(6.0))
+    assert row["status"] == "SPED_UP"
+    assert "2%" in row["note"] or "3%" in row["note"]  # ~2.5% of real time
+
+
+def test_stretched(tmp_path):
+    touch(tmp_path / "clip.mp4")
+    row = check_playback.check_entry(entry(duration=5.0), tmp_path,
+                                     probe=canned_probe(20.0))
+    assert row["status"] == "STRETCHED"
+
+
+def test_absolute_floor_protects_short_sessions(tmp_path):
+    # 10% of a 1s session is 0.1s -- the 2s floor must win instead.
+    touch(tmp_path / "clip.mp4")
+    row = check_playback.check_entry(entry(duration=1.0), tmp_path,
+                                     probe=canned_probe(2.5))
+    assert row["status"] == "OK"
+    row = check_playback.check_entry(entry(duration=5.0), tmp_path,
+                                     probe=canned_probe(1.0))
+    assert row["status"] == "SPED_UP"
+
+
+def test_missing_file(tmp_path):
+    row = check_playback.check_entry(entry(file="gone.mp4"), tmp_path,
+                                     probe=canned_probe(60.0))
+    assert row["status"] == "MISSING"
+
+
+def test_no_file_is_informational_not_drift(tmp_path):
+    row = check_playback.check_entry(entry(file=None), tmp_path,
+                                     probe=canned_probe(60.0))
+    assert row["status"] == "NO_FILE"
+
+
+def test_unreadable_video(tmp_path):
+    touch(tmp_path / "clip.mp4")
+    row = check_playback.check_entry(entry(), tmp_path,
+                                     probe=canned_probe(None))
+    assert row["status"] == "UNREADABLE"
+
+
+@pytest.mark.parametrize("duration", [None, 0, -5, "soon", float("nan")])
+def test_no_usable_duration(tmp_path, duration):
+    touch(tmp_path / "clip.mp4")
+    row = check_playback.check_entry(entry(duration=duration), tmp_path,
+                                     probe=canned_probe(60.0))
+    assert row["status"] == "NO_DURATION"
+
+
+# --- ffmpeg probing --------------------------------------------------------
+
+FFMPEG_STDERR = (
+    "ffmpeg version 7.0.2 Copyright (c) 2000-2024 the FFmpeg developers\n"
+    "  Duration: 00:04:12.50, start: 0.000000, bitrate: 812 kb/s\n"
+    "  Stream #0:0(und): Video: h264 (Main) (avc1 / 0x31637661), "
+    "yuv420p, 3840x2160, 60 fps, 60 tbr, 15360 tbn\n"
+)
+
+
+def run_with_stderr(stderr_text):
+    proc = SimpleNamespace(stderr=stderr_text, returncode=1)
+    with mock.patch.object(check_playback.subprocess, "run",
+                           return_value=proc) as run:
+        result = check_playback.probe_video_duration(Path("clip.mp4"))
+    run.assert_called_once()
+    return result
+
+
+def test_probe_parses_duration():
+    assert run_with_stderr(FFMPEG_STDERR) == pytest.approx(252.5)
+
+
+def test_probe_garbage_stderr_is_none():
+    assert run_with_stderr("not an ffmpeg output\n") is None
+
+
+def test_probe_duration_na_is_none():
+    assert run_with_stderr("  Duration: N/A, start: 0.000000\n") is None
+
+
+def test_probe_ffmpeg_crash_is_none():
+    with mock.patch.object(check_playback.subprocess, "run",
+                           side_effect=OSError("no ffmpeg")):
+        assert check_playback.probe_video_duration(Path("clip.mp4")) is None
+
+
+# --- end to end with real clips --------------------------------------------
+
+def write_clip(path: Path, frames: int, fps: int):
+    import imageio.v2 as imageio
+    import numpy as np
+    writer = imageio.get_writer(str(path), fps=fps, macro_block_size=1)
+    frame = np.zeros((48, 64, 3), dtype=np.uint8)
+    for _ in range(frames):
+        writer.append_data(frame)
+    writer.close()
+
+
+def write_log(path: Path, rows):
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n",
+                    encoding="utf-8")
+
+
+def test_e2e_real_clips(tmp_path):
+    write_clip(tmp_path / "good.mp4", frames=60, fps=60)     # 1.0 s
+    write_clip(tmp_path / "long.mp4", frames=600, fps=30)    # 20.0 s
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [
+        entry(file="good.mp4", duration=1.0),     # OK
+        entry(file="good.mp4", duration=240.0),   # SPED_UP (issue #1 shape)
+        entry(file="long.mp4", duration=1.0),     # STRETCHED
+        entry(file="gone.mp4", duration=60.0),    # MISSING
+        entry(file=None, duration=60.0),          # NO_FILE
+    ])
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = check_playback.main(
+            ["--log", str(log), "--video-dir", str(tmp_path), "--json"])
+    assert code == 1
+    payload = json.loads(buf.getvalue())
+    by_file = {}
+    for row in payload["sessions"]:
+        by_file.setdefault(row["file"], []).append(row["status"])
+    assert by_file["good.mp4"] == ["OK", "SPED_UP"]
+    assert by_file["long.mp4"] == ["STRETCHED"]
+    assert by_file["gone.mp4"] == ["MISSING"]
+    assert by_file[None] == ["NO_FILE"]
+    assert payload["drifted"] == 2
+
+
+def test_e2e_clean_log_exits_0(tmp_path):
+    write_clip(tmp_path / "good.mp4", frames=60, fps=60)
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [entry(file="good.mp4", duration=1.0)])
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = check_playback.main(
+            ["--log", str(log), "--video-dir", str(tmp_path)])
+    assert code == 0
+    assert "[        OK]" in buf.getvalue()
+
+
+def test_main_missing_log_exits_0(tmp_path):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = check_playback.main(
+            ["--log", str(tmp_path / "nope.jsonl"),
+             "--video-dir", str(tmp_path)])
+    assert code == 0
+    assert "0 session(s) checked" in buf.getvalue()
+
+
+def test_main_bad_tolerance_exits_2(tmp_path, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        check_playback.main(["--tolerance", "-1"])
+    assert excinfo.value.code == 2
+    assert "tolerance" in capsys.readouterr().err
+
+
+def test_format_text_summary_counts():
+    rows = [
+        {"file": "a.mp4", "duration_s": 60.0, "video_s": 60.0,
+         "status": "OK", "note": ""},
+        {"file": "b.mp4", "duration_s": 60.0, "video_s": 2.0,
+         "status": "SPED_UP", "note": "video is 2.0s for 60.0s of capture"},
+    ]
+    text = check_playback.format_text(rows, Path("sessions.jsonl"), skipped=1)
+    assert "2 session(s) checked: 1 drifted, 1 ok" in text
+    assert "skipped 1 unreadable log line(s)" in text
+    assert "sped-up playback" in text
