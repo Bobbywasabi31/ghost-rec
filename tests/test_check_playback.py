@@ -12,7 +12,6 @@ import io
 import json
 from contextlib import redirect_stdout
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -105,7 +104,7 @@ def test_no_usable_duration(tmp_path, duration):
     assert row["status"] == "NO_DURATION"
 
 
-# --- ffmpeg probing --------------------------------------------------------
+# --- duration parsing (pure; no mocking needed) -------------------------------
 
 FFMPEG_STDERR = (
     "ffmpeg version 7.0.2 Copyright (c) 2000-2024 the FFmpeg developers\n"
@@ -115,30 +114,22 @@ FFMPEG_STDERR = (
 )
 
 
-def run_with_stderr(stderr_text):
-    proc = SimpleNamespace(stderr=stderr_text, returncode=1)
-    with mock.patch.object(check_playback.subprocess, "run",
-                           return_value=proc) as run:
-        result = check_playback.probe_video_duration(Path("clip.mp4"))
-    run.assert_called_once()
-    return result
+def test_parse_duration_ok():
+    assert check_playback._parse_duration(FFMPEG_STDERR) == pytest.approx(252.5)
 
 
-def test_probe_parses_duration():
-    assert run_with_stderr(FFMPEG_STDERR) == pytest.approx(252.5)
+def test_parse_duration_garbage_is_none():
+    assert check_playback._parse_duration("not an ffmpeg output\n") is None
 
 
-def test_probe_garbage_stderr_is_none():
-    assert run_with_stderr("not an ffmpeg output\n") is None
+def test_parse_duration_na_is_none():
+    assert check_playback._parse_duration(
+        "  Duration: N/A, start: 0.000000\n") is None
 
 
-def test_probe_duration_na_is_none():
-    assert run_with_stderr("  Duration: N/A, start: 0.000000\n") is None
-
-
-def test_probe_ffmpeg_crash_is_none():
-    with mock.patch.object(check_playback.subprocess, "run",
-                           side_effect=OSError("no ffmpeg")):
+def test_probe_none_when_ffmpeg_unavailable():
+    with mock.patch.object(check_playback, "_ffmpeg_stderr",
+                           return_value=None):
         assert check_playback.probe_video_duration(Path("clip.mp4")) is None
 
 

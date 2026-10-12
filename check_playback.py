@@ -55,11 +55,11 @@ def _coerce_seconds(value) -> float | None:
     return number if number > 0 else None
 
 
-def probe_video_duration(path: Path) -> float | None:
-    """Return an MP4's playback duration in seconds, or None if unprobable.
+def _ffmpeg_stderr(path: Path) -> str | None:
+    """Run the bundled ffmpeg with `-i` and return its stderr, or None.
 
-    Runs the bundled ffmpeg with `-i` and parses the `Duration:` line from
-    its stderr. Never decodes frames, so even 4K clips probe in milliseconds.
+    Never decodes frames, so even 4K clips probe in milliseconds. Returns
+    None when ffmpeg is unavailable or the file can't be opened.
     """
     if get_ffmpeg_exe is None:
         return None
@@ -76,7 +76,12 @@ def probe_video_duration(path: Path) -> float | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    match = _DURATION_RE.search(proc.stderr)
+    return proc.stderr
+
+
+def _parse_duration(stderr: str) -> float | None:
+    """Parse ffmpeg's `Duration: HH:MM:SS.cc` line; None when absent."""
+    match = _DURATION_RE.search(stderr)
     if not match:
         return None
     hours, minutes, seconds = match.groups()
@@ -84,6 +89,14 @@ def probe_video_duration(path: Path) -> float | None:
         return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
     except ValueError:
         return None
+
+
+def probe_video_duration(path: Path) -> float | None:
+    """Return an MP4's playback duration in seconds, or None if unprobable."""
+    stderr = _ffmpeg_stderr(path)
+    if stderr is None:
+        return None
+    return _parse_duration(stderr)
 
 
 def check_entry(
