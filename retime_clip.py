@@ -104,9 +104,11 @@ def retime_factor(encoded_s: float, target_s: float) -> float:
     return target_s / encoded_s
 
 
-def already_realtime(encoded_s: float, target_s: float) -> bool:
+def already_realtime(encoded_s: float, target_s: float,
+                     rel_tol: float = REL_TOL,
+                     abs_floor: float = ABS_FLOOR) -> bool:
     """True when the clip is close enough to real time to leave alone."""
-    return abs(encoded_s - target_s) <= max(REL_TOL * target_s, ABS_FLOOR)
+    return abs(encoded_s - target_s) <= max(rel_tol * target_s, abs_floor)
 
 
 def build_command(exe: str, input_path: Path, output_path: Path,
@@ -135,8 +137,15 @@ def _ffmpeg_run(cmd: list[str], timeout: int = 1800):
 def retime(input_path: Path, target_s: float, output_path: Path,
            force: bool = False, dry_run: bool = False,
            probe=probe_video_duration,
-           run=_ffmpeg_run) -> tuple[int, str]:
-    """Repair one clip; return (exit_code, human-readable message)."""
+           run=_ffmpeg_run,
+           rel_tol: float = REL_TOL,
+           abs_floor: float = ABS_FLOOR) -> tuple[int, str]:
+    """Repair one clip; return (exit_code, human-readable message).
+
+    rel_tol/abs_floor shape the already-real-time no-op gate; batch callers
+    (retime_all) pass the selection tolerance so a flagged clip is actually
+    repaired instead of no-op'd.
+    """
     if output_path.exists() and not force:
         return 2, (
             f"{output_path} already exists -- pass --force to overwrite "
@@ -147,7 +156,7 @@ def retime(input_path: Path, target_s: float, output_path: Path,
     encoded_s = probe(input_path)
     if encoded_s is None:
         return 1, f"could not probe a video duration from {input_path}"
-    if already_realtime(encoded_s, target_s):
+    if already_realtime(encoded_s, target_s, rel_tol, abs_floor):
         return 0, (
             f"{input_path.name} already plays at real time "
             f"({encoded_s:.1f}s vs {target_s:.1f}s target) -- nothing to do"

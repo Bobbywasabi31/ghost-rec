@@ -128,6 +128,29 @@ without `--force`; does nothing when the clip already plays at real time
 beyond 120x as a probable bad log entry, requiring `--force`. Exit code
 is 1 when the clip can't be probed or ffmpeg fails, 2 on a usage error.
 
+`retime_all.py` (issue #1 follow-up) repairs *every* clip that
+`check_playback.py` flags `SPED_UP` in one pass — for when more than one
+pre-fix recording needs repairing. It reuses `retime_clip`'s logic per
+clip (same `<name>.retimed.mp4` outputs, same `--force`/`--dry-run`
+semantics), skips outputs that already exist unless `--force`, and keeps
+going when one clip fails. STRETCHED clips are left alone on purpose:
+shrinking them could destroy legitimate content. The `--tolerance` used
+for flagging also shapes the repair gate, so a clip flagged at a
+stricter tolerance is actually repaired, not no-op'd:
+
+```
+python retime_all.py                  # default log location above
+python retime_all.py --log path\to\sessions.jsonl
+python retime_all.py --video-dir path\to\clips
+python retime_all.py --dry-run        # report only, run no ffmpeg
+python retime_all.py --force          # overwrite existing .retimed.mp4s
+python retime_all.py --json           # machine-readable report
+```
+
+Exit code is 0 when there was nothing to repair or every repair
+succeeded, 1 when at least one repair failed or was refused (details in
+the report), 2 on a usage error.
+
 ## Audio (optional, off by default)
 
 `Ctrl+Shift+A` toggles system-audio capture. It records **whatever plays
