@@ -224,7 +224,7 @@ def test_format_text_summary_counts():
 
 # --- --from/--to date-range filtering -------------------------------------
 
-from datetime import date
+from datetime import date, timedelta
 
 
 def dated_entry(day, file, duration=60.0):
@@ -464,3 +464,77 @@ def test_main_json_csv_conflict_exits_2(tmp_path, capsys):
         check_playback.main(["--json", "--csv"])
     assert excinfo.value.code == 2
     assert "cannot be combined" in capsys.readouterr().err
+
+
+# --- --days N shortcut -------------------------------------------------------
+
+def days_ago_entry(days_ago, file):
+    day = (date.today() - timedelta(days=days_ago)).isoformat()
+    return dated_entry(day, file)
+
+
+def test_main_days_filters_to_last_n_days(tmp_path):
+    # Files are absent on purpose: MISSING needs no real ffmpeg probing,
+    # so this stays hermetic on both CI runners.
+    log = write_log_with(tmp_path, [
+        days_ago_entry(0, "today.mp4"),
+        days_ago_entry(6, "six-ago.mp4"),
+        days_ago_entry(8, "eight-ago.mp4"),
+        {"file": "c.mp4", "duration_s": 60.0},  # undated: excluded + counted
+    ])
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = check_playback.main(
+            ["--log", str(log), "--video-dir", str(tmp_path), "--days", "7"])
+    assert code == 0  # MISSING is informational, not drift
+    out = buf.getvalue()
+    lo = (date.today() - timedelta(days=6)).isoformat()
+    hi = date.today().isoformat()
+    assert f"range: {lo} -> {hi}" in out
+    assert "today.mp4" in out and "six-ago.mp4" in out
+    assert "eight-ago.mp4" not in out and "c.mp4" not in out
+    assert "2 session(s) checked" in out
+    assert "excluded 1 session(s) outside the range" in out
+    assert "excluded 1 session(s) with no usable date" in out
+
+
+def test_main_from_overrides_days_lower_bound(tmp_path):
+    log = write_log_with(tmp_path, [
+        days_ago_entry(0, "today.mp4"),
+        days_ago_entry(1, "yesterday.mp4"),
+        days_ago_entry(6, "six-ago.mp4"),
+    ])
+    # --from sets the lower bound; --days still supplies today as the upper
+    args = ["--log", str(log), "--video-dir", str(tmp_path), "--days", "7",
+            "--from", (date.today() - timedelta(days=1)).isoformat()]
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = check_playback.main(args)
+    assert code == 0
+    out = buf.getvalue()
+    assert "today.mp4" in out and "yesterday.mp4" in out
+    assert "six-ago.mp4" not in out
+    assert "2 session(s) checked" in out
+
+
+def test_main_days_json_reports_resolved_bounds(tmp_path):
+    log = write_log_with(tmp_path, [days_ago_entry(0, "today.mp4")])
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = check_playback.main(
+            ["--log", str(log), "--video-dir", str(tmp_path),
+             "--json", "--days", "3"])
+    assert code == 0
+    payload = json.loads(buf.getvalue())
+    assert (payload["date_from"]
+            == (date.today() - timedelta(days=2)).isoformat())
+    assert payload["date_to"] == date.today().isoformat()
+    assert len(payload["sessions"]) == 1
+
+
+@pytest.mark.parametrize("bad", ["abc", "0", "-5"])
+def test_main_bad_days_exits_2(tmp_path, capsys, bad):
+    with pytest.raises(SystemExit) as excinfo:
+        check_playback.main(["--days", bad])
+    assert excinfo.value.code == 2
+    assert "positive integer" in capsys.readouterr().err

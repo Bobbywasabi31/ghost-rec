@@ -15,6 +15,7 @@ and flags drift in either direction:
     python check_playback.py --json           # machine-readable report
     python check_playback.py --csv            # spreadsheet-friendly CSV
     python check_playback.py --from 2026-10-01 --to 2026-10-10  # date range
+    python check_playback.py --days 7     # last 7 days including today
 
 Video probing uses the ffmpeg binary bundled with imageio-ffmpeg (already a
 ghost-rec dependency); the file itself is never decoded frame-by-frame.
@@ -22,7 +23,10 @@ ghost-rec dependency); the file itself is never decoded frame-by-frame.
 The date range filters by session start day (inclusive, one-sided ok),
 mirroring sessions_summary.py: sessions outside the range are not checked,
 and sessions with no usable start date are excluded (and counted) whenever
-a bound is set.
+a bound is set. `--days N` (N >= 1) is shorthand for the last N days
+including today and just fills whichever bound an explicit --from/--to
+doesn't set, so `--from 2026-10-01 --days 30` checks that day through
+today; garbage --days values exit 2.
 
 Exit codes: 0 = every checkable session is within tolerance (or nothing was
 checkable), 1 = at least one session drifted beyond tolerance, 2 = usage
@@ -44,7 +48,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from sessions_summary import _parse_day, filter_entries_by_date, load_entries
+from sessions_summary import (
+    _parse_day, filter_entries_by_date, load_entries, resolve_days_range,
+)
 
 DEFAULT_LOG = Path.home() / "Videos" / "ghost" / "sessions.jsonl"
 
@@ -285,6 +291,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--to", dest="date_to", default=None,
                         help="only check sessions starting on/before "
                         "YYYY-MM-DD")
+    parser.add_argument("--days", default=None, metavar="N",
+                        help="shorthand for the last N days including today; "
+                        "fills any bound that --from/--to doesn't set")
     parser.add_argument("--json", action="store_true",
                         help="machine-readable JSON report on stdout")
     parser.add_argument("--csv", action="store_true",
@@ -295,11 +304,22 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--json and --csv cannot be combined")
     if args.tolerance < 0:
         parser.error("--tolerance must be >= 0")
-    date_from = date_to = None
-    if args.date_from or args.date_to:
+    # --days supplies defaults; explicit --from/--to override whichever
+    # bound they name, so e.g. --from 2026-10-01 --days 30 checks that day
+    # through today.
+    days_from = days_to = None
+    if args.days is not None:
         try:
-            date_from = _parse_day(args.date_from) if args.date_from else None
-            date_to = _parse_day(args.date_to) if args.date_to else None
+            days_from, days_to = resolve_days_range(args.days)
+        except ValueError as exc:
+            parser.error(str(exc))
+    date_from = date_to = None
+    if args.date_from or args.date_to or days_from is not None:
+        try:
+            date_from = (_parse_day(args.date_from) if args.date_from
+                         else days_from)
+            date_to = (_parse_day(args.date_to) if args.date_to
+                       else days_to)
         except ValueError as exc:
             parser.error(str(exc))
         if date_from and date_to and date_from > date_to:
