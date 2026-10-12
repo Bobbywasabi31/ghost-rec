@@ -14,6 +14,7 @@ its logged duration in a single run:
     python retime_all.py --dry-run        # report only, run no ffmpeg
     python retime_all.py --force          # overwrite existing .retimed.mp4s
     python retime_all.py --json           # machine-readable report
+    python retime_all.py --csv            # spreadsheet-friendly CSV
     python retime_all.py --from 2026-10-01 --to 2026-10-10  # date range
 
 The date range filters by session start day (inclusive, one-sided ok),
@@ -39,6 +40,8 @@ sibling tools.
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import sys
 from pathlib import Path
@@ -160,6 +163,26 @@ def format_text(outcomes: list[dict], log_path: Path, skipped: int,
     return "\n".join(lines) + "\n"
 
 
+def format_csv(outcomes: list[dict]) -> str:
+    """Render the per-clip repair outcomes as a spreadsheet-friendly CSV.
+
+    One header row (file,output,code,message), then one row per clip.
+    Plain decimals and strings so spreadsheets and pandas parse cleanly;
+    stdlib csv handles quoting, so commas in filenames round-trip.
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["file", "output", "code", "message"])
+    for outcome in outcomes:
+        writer.writerow([
+            outcome["file"] or "",
+            outcome["output"] or "",
+            outcome["code"],
+            outcome["message"] or "",
+        ])
+    return buf.getvalue()
+
+
 def main(
     argv: list[str] | None = None,
     probe=probe_video_duration,
@@ -192,7 +215,12 @@ def main(
                         "YYYY-MM-DD")
     parser.add_argument("--json", action="store_true",
                         help="machine-readable JSON report on stdout")
+    parser.add_argument("--csv", action="store_true",
+                        help="print the results as CSV (notes go to stderr "
+                        "so stdout stays pure)")
     args = parser.parse_args(argv)
+    if args.json and args.csv:
+        parser.error("--json and --csv cannot be combined")
     if args.tolerance < 0:
         parser.error("--tolerance must be >= 0")
     date_from = date_to = None
@@ -233,6 +261,22 @@ def main(
         }
         json.dump(payload, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
+    elif args.csv:
+        sys.stdout.write(format_csv(outcomes))
+        notes = [f"log: {args.log}"]
+        if date_from is not None or date_to is not None:
+            lo = date_from.isoformat() if date_from else "beginning"
+            hi = date_to.isoformat() if date_to else "end"
+            notes.append(f"range: {lo} -> {hi}")
+        if skipped:
+            notes.append(f"skipped {skipped} unreadable line(s)")
+        if out_of_range:
+            notes.append(
+                f"excluded {out_of_range} session(s) outside the range")
+        if undated_excluded:
+            notes.append(
+                f"excluded {undated_excluded} session(s) with no usable date")
+        sys.stderr.write("\n".join(notes) + "\n")
     else:
         sys.stdout.write(format_text(outcomes, args.log, skipped,
                                      date_from, date_to,

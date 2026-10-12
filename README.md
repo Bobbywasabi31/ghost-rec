@@ -155,6 +155,7 @@ python retime_all.py --video-dir path\to\clips
 python retime_all.py --dry-run        # report only, run no ffmpeg
 python retime_all.py --force          # overwrite existing .retimed.mp4s
 python retime_all.py --json           # machine-readable report
+python retime_all.py --csv            # per-clip results as CSV (notes go to stderr so stdout stays pure)
 python retime_all.py --from 2026-10-01 --to 2026-10-10  # only repair clips recorded in that date range (session start day, inclusive)
 ```
 

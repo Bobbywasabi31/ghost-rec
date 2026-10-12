@@ -10,9 +10,10 @@ per-clip outcomes, existing-output skips, --force, --dry-run, batch
 continuation after a failure, and the CLI exit codes.
 """
 
+import csv
 import io
 import json
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -484,3 +485,115 @@ def test_format_text_shows_range_and_exclusions(tmp_path):
     assert "range: 2026-10-01 -> 2026-10-10" in text
     assert "(excluded 2 session(s) outside the range)" in text
     assert "(excluded 1 session(s) with no usable date)" in text
+
+
+# --- --csv export ------------------------------------------------------------
+
+def run_main_streams(argv, probe, run):
+    out = io.StringIO()
+    err = io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = retime_all.main(argv, probe=probe, run=run)
+    return code, out.getvalue(), err.getvalue()
+
+
+def test_format_csv_header_and_rows():
+    csv_text = retime_all.format_csv([
+        {"file": "a.mp4", "output": "a.retimed.mp4",
+         "code": 0, "message": "repaired"},
+        {"file": "b.mp4", "output": "b.retimed.mp4",
+         "code": 1, "message": "ffmpeg boom"},
+    ])
+    rows = list(csv.reader(io.StringIO(csv_text)))
+    assert rows[0] == ["file", "output", "code", "message"]
+    assert rows[1] == ["a.mp4", "a.retimed.mp4", "0", "repaired"]
+    assert rows[2] == ["b.mp4", "b.retimed.mp4", "1", "ffmpeg boom"]
+
+
+def test_format_csv_comma_in_filename_roundtrips():
+    csv_text = retime_all.format_csv([
+        {"file": "clip, one.mp4", "output": "clip, one.retimed.mp4",
+         "code": 0, "message": "ok, repaired"},
+    ])
+    rows = list(csv.reader(io.StringIO(csv_text)))
+    assert rows[1] == ["clip, one.mp4", "clip, one.retimed.mp4",
+                       "0", "ok, repaired"]
+
+
+def test_format_csv_empty_outcomes_is_header_only():
+    rows = list(csv.reader(io.StringIO(retime_all.format_csv([]))))
+    assert rows == [["file", "output", "code", "message"]]
+
+
+def test_main_csv_stdout_is_pure_csv_and_notes_on_stderr(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [entry("clip.mp4", 60.0)])
+    code, text, err = run_main_streams(
+        ["--log", str(log), "--csv"],
+        canned_probe({"clip.mp4": 6.0}), make_run([]))
+    assert code == 0
+    rows = list(csv.reader(io.StringIO(text)))
+    assert rows[0] == ["file", "output", "code", "message"]
+    assert rows[1][0] == "clip.mp4"
+    assert rows[1][2] == "0"
+    assert rows[1][1].endswith("clip.retimed.mp4")
+    assert f"log: {log}" in err
+
+
+def test_main_csv_empty_outcomes_header_only(tmp_path):
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [entry("clip.mp4", 60.0)])  # probed at real time
+    code, text, err = run_main_streams(
+        ["--log", str(log), "--csv"],
+        canned_probe({"clip.mp4": 60.0}), make_run([]))
+    assert code == 0
+    assert list(csv.reader(io.StringIO(text))) == [
+        ["file", "output", "code", "message"]]
+    assert f"log: {log}" in err
+
+
+def test_main_csv_failed_repair_row_and_exit_1(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [entry("clip.mp4", 60.0)])
+    code, text, _ = run_main_streams(
+        ["--log", str(log), "--csv"],
+        canned_probe({"clip.mp4": 6.0}), make_run([], fail_on=["clip"]))
+    assert code == 1
+    rows = list(csv.reader(io.StringIO(text)))
+    assert rows[1][2] == "1"
+    assert "mock ffmpeg boom" in rows[1][3]
+
+
+def test_main_csv_skipped_line_note_on_stderr(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    log = tmp_path / "sessions.jsonl"
+    log.write_text("not json\n" + json.dumps(entry("clip.mp4", 60.0)) + "\n",
+                   encoding="utf-8")
+    _, text, err = run_main_streams(
+        ["--log", str(log), "--csv"],
+        canned_probe({"clip.mp4": 6.0}), make_run([]))
+    assert "skipped 1 unreadable line(s)" in err
+    rows = list(csv.reader(io.StringIO(text)))
+    assert len(rows) == 2  # header + the one repaired clip
+
+
+def test_main_csv_range_note_on_stderr(tmp_path):
+    log, probe = _two_day_log(tmp_path)
+    _, text, err = run_main_streams(
+        ["--log", str(log), "--from", "2026-10-10", "--to", "2026-10-11",
+         "--csv"],
+        probe, make_run([]))
+    assert "range: 2026-10-10 -> 2026-10-11" in err
+    rows = list(csv.reader(io.StringIO(text)))
+    assert len(rows) == 3  # header + both clips
+
+
+def test_main_json_and_csv_conflict_is_usage_error():
+    with pytest.raises(SystemExit) as exc_info:
+        retime_all.main(["--json", "--csv"])
+    assert exc_info.value.code == 2
