@@ -14,6 +14,12 @@ its logged duration in a single run:
     python retime_all.py --dry-run        # report only, run no ffmpeg
     python retime_all.py --force          # overwrite existing .retimed.mp4s
     python retime_all.py --json           # machine-readable report
+    python retime_all.py --from 2026-10-01 --to 2026-10-10  # date range
+
+The date range filters by session start day (inclusive, one-sided ok),
+mirroring ``check_playback.py``: sessions starting outside the range are
+not repaired, and sessions with no usable start date are excluded (and
+counted) whenever a bound is set.
 
 Each clip is repaired exactly as ``retime_clip.py`` would: the video
 stream is re-encoded with stretched timestamps (frames held as needed at
@@ -39,6 +45,7 @@ from pathlib import Path
 
 from check_playback import check_log, probe_video_duration
 from retime_clip import ABS_FLOOR, REL_TOL, _ffmpeg_run, resolve_output, retime
+from sessions_summary import _parse_day
 
 DEFAULT_LOG = Path.home() / "Videos" / "ghost" / "sessions.jsonl"
 
@@ -49,16 +56,23 @@ def find_sped_up(
     probe=probe_video_duration,
     rel_tol: float = REL_TOL,
     abs_floor: float = ABS_FLOOR,
-) -> tuple[list[dict], int]:
-    """Return (results, skipped_lines) for clips check_playback flags SPED_UP.
+    date_from=None,
+    date_to=None,
+) -> tuple[list[dict], int, int, int]:
+    """Return (results, skipped, out_of_range, undated_excluded) for clips
+    check_playback flags SPED_UP.
 
     *results* are the raw check_playback result dicts (file, duration_s,
     video_s, status, note) -- only the SPED_UP ones. STRETCHED clips are
-    deliberately excluded (see module docstring).
+    deliberately excluded (see module docstring). date_from/date_to are
+    YYYY-MM-DD dates limiting the selection to sessions starting within
+    [date_from, date_to], exactly as in check_playback.check_log.
     """
-    results, skipped, _out_of_range, _undated_excluded = check_log(
-        log_path, video_dir, probe, rel_tol=rel_tol, abs_floor=abs_floor)
-    return [r for r in results if r["status"] == "SPED_UP"], skipped
+    results, skipped, out_of_range, undated_excluded = check_log(
+        log_path, video_dir, probe, rel_tol=rel_tol, abs_floor=abs_floor,
+        date_from=date_from, date_to=date_to)
+    return ([r for r in results if r["status"] == "SPED_UP"],
+            skipped, out_of_range, undated_excluded)
 
 
 def repair_all(
@@ -113,11 +127,24 @@ def summarize(outcomes: list[dict]) -> dict:
     return counts
 
 
-def format_text(outcomes: list[dict], log_path: Path, skipped: int) -> str:
+def format_text(outcomes: list[dict], log_path: Path, skipped: int,
+                date_from=None, date_to=None,
+                out_of_range: int = 0, undated_excluded: int = 0) -> str:
     """Render a human-readable report."""
     lines = [f"batch repair: {log_path}"]
+    if date_from is not None or date_to is not None:
+        lo = date_from.isoformat() if date_from else "beginning"
+        hi = date_to.isoformat() if date_to else "end"
+        lines.append(f"  range: {lo} -> {hi}")
     if skipped:
         lines.append(f"  (skipped {skipped} unreadable log line(s))")
+    if out_of_range:
+        lines.append(
+            f"  (excluded {out_of_range} session(s) outside the range)")
+    if undated_excluded:
+        lines.append(
+            f"  (excluded {undated_excluded} session(s) with no usable date)"
+        )
     if not outcomes:
         lines.append("nothing to repair -- no SPED_UP clips found")
         return "\n".join(lines) + "\n"
@@ -157,16 +184,32 @@ def main(
     parser.add_argument("--dry-run", action="store_true",
                         help="report what would be repaired without running "
                         "ffmpeg")
+    parser.add_argument("--from", dest="date_from", default=None,
+                        help="only repair sessions starting on/after "
+                        "YYYY-MM-DD")
+    parser.add_argument("--to", dest="date_to", default=None,
+                        help="only repair sessions starting on/before "
+                        "YYYY-MM-DD")
     parser.add_argument("--json", action="store_true",
                         help="machine-readable JSON report on stdout")
     args = parser.parse_args(argv)
     if args.tolerance < 0:
         parser.error("--tolerance must be >= 0")
+    date_from = date_to = None
+    if args.date_from or args.date_to:
+        try:
+            date_from = _parse_day(args.date_from) if args.date_from else None
+            date_to = _parse_day(args.date_to) if args.date_to else None
+        except ValueError as exc:
+            parser.error(str(exc))
+        if date_from and date_to and date_from > date_to:
+            parser.error(f"--from {date_from} is after --to {date_to}")
     video_dir = args.video_dir or args.log.parent
 
     rel_tol = args.tolerance / 100.0
-    results, skipped = find_sped_up(
-        args.log, video_dir, probe=probe, rel_tol=rel_tol
+    results, skipped, out_of_range, undated_excluded = find_sped_up(
+        args.log, video_dir, probe=probe, rel_tol=rel_tol,
+        date_from=date_from, date_to=date_to,
     )
     outcomes = repair_all(
         results, video_dir, force=args.force, dry_run=args.dry_run,
@@ -179,6 +222,10 @@ def main(
             "video_dir": str(video_dir),
             "tolerance_pct": args.tolerance,
             "skipped_lines": skipped,
+            "date_from": date_from.isoformat() if date_from else None,
+            "date_to": date_to.isoformat() if date_to else None,
+            "out_of_range": out_of_range,
+            "undated_excluded": undated_excluded,
             "sped_up": len(results),
             "dry_run": args.dry_run,
             "outcomes": outcomes,
@@ -187,7 +234,9 @@ def main(
         json.dump(payload, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
     else:
-        sys.stdout.write(format_text(outcomes, args.log, skipped))
+        sys.stdout.write(format_text(outcomes, args.log, skipped,
+                                     date_from, date_to,
+                                     out_of_range, undated_excluded))
     return 1 if counts["failed"] or counts["skipped_or_refused"] else 0
 
 

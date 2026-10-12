@@ -60,9 +60,9 @@ def write_log(path: Path, entries):
     )
 
 
-def entry(file="clip.mp4", duration=60.0):
+def entry(file="clip.mp4", duration=60.0, start="2026-10-11T12:00:00"):
     return {
-        "start": "2026-10-11T12:00:00",
+        "start": start,
         "stop": "2026-10-11T12:01:00",
         "duration_s": duration,
         "file": file,
@@ -89,8 +89,10 @@ def test_find_sped_up_filters_only_sped_up(tmp_path):
                     entry("ok.mp4", 60.0),
                     entry("gone.mp4", 60.0)])
     probe = canned_probe({"clip.mp4": 6.0, "ok.mp4": 59.0})
-    results, skipped = retime_all.find_sped_up(log, tmp_path, probe=probe)
+    results, skipped, out_of_range, undated = retime_all.find_sped_up(
+        log, tmp_path, probe=probe)
     assert skipped == 0
+    assert (out_of_range, undated) == (0, 0)
     assert [r["file"] for r in results] == ["clip.mp4"]
     assert results[0]["status"] == "SPED_UP"
 
@@ -99,9 +101,10 @@ def test_find_sped_up_counts_bad_log_lines(tmp_path):
     log = tmp_path / "sessions.jsonl"
     log.write_text('{"file": "clip.mp4", "duration_s": 60.0}\nnot json\n',
                    encoding="utf-8")
-    results, skipped = retime_all.find_sped_up(
+    results, skipped, out_of_range, undated = retime_all.find_sped_up(
         log, tmp_path, probe=canned_probe({}))
     assert skipped == 1
+    assert (out_of_range, undated) == (0, 0)
     assert results == []  # clip.mp4 never probed: file missing -> MISSING
 
 
@@ -110,16 +113,17 @@ def test_find_sped_up_leaves_stretched_clips_alone(tmp_path):
     touch(clip)
     log = tmp_path / "sessions.jsonl"
     write_log(log, [entry("clip.mp4", 60.0)])
-    results, _ = retime_all.find_sped_up(
+    results, skipped, out_of_range, undated = retime_all.find_sped_up(
         log, tmp_path, probe=canned_probe({"clip.mp4": 120.0}))
+    assert (skipped, out_of_range, undated) == (0, 0, 0)
     assert results == []  # STRETCHED is a different symptom; not ours
 
 
 def test_find_sped_up_missing_log_is_empty(tmp_path):
-    results, skipped = retime_all.find_sped_up(
+    results, skipped, out_of_range, undated = retime_all.find_sped_up(
         tmp_path / "nope.jsonl", tmp_path, probe=canned_probe({}))
     assert results == []
-    assert skipped == 0
+    assert (skipped, out_of_range, undated) == (0, 0, 0)
 
 
 # --- batch repair -----------------------------------------------------------
@@ -377,3 +381,106 @@ def test_main_video_dir_flag(tmp_path):
     assert len(calls) == 1
     # repaired clip lands next to the input, not next to the log
     assert str(clips / "clip.retimed.mp4") in " ".join(calls[0])
+
+
+# --- date range -------------------------------------------------------------
+
+def _two_day_log(tmp_path):
+    """Two SPED_UP clips on consecutive days; both files present."""
+    for name in ("old.mp4", "new.mp4"):
+        touch(tmp_path / name)
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [
+        entry("old.mp4", 60.0, start="2026-10-10T12:00:00"),
+        entry("new.mp4", 60.0, start="2026-10-11T12:00:00"),
+    ])
+    probe = canned_probe({"old.mp4": 6.0, "new.mp4": 6.0})
+    return log, probe
+
+
+def test_find_sped_up_date_range_filters_out_of_range(tmp_path):
+    from datetime import date
+    log, probe = _two_day_log(tmp_path)
+    results, skipped, out_of_range, undated = retime_all.find_sped_up(
+        log, tmp_path, probe=probe, date_from=date(2026, 10, 11))
+    assert skipped == 0
+    assert undated == 0
+    assert out_of_range == 1
+    assert [r["file"] for r in results] == ["new.mp4"]
+
+
+def test_find_sped_up_undated_excluded_when_bound_set(tmp_path):
+    from datetime import date
+    log, probe = _two_day_log(tmp_path)
+    # an entry with no usable start date cannot be placed in the range
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write('{"file": "dateless.mp4", "duration_s": 60.0}\n')
+    touch(tmp_path / "dateless.mp4")
+    results, skipped, out_of_range, undated = retime_all.find_sped_up(
+        log, tmp_path, probe=probe, date_to=date(2026, 10, 11))
+    assert skipped == 0
+    assert out_of_range == 0
+    assert undated == 1
+    assert [r["file"] for r in results] == ["old.mp4", "new.mp4"]
+
+
+def test_main_from_selects_only_in_range_clips(tmp_path):
+    log, probe = _two_day_log(tmp_path)
+    calls = []
+    code, text = run_main(
+        ["--log", str(log), "--from", "2026-10-11"],
+        probe, make_run(calls))
+    assert code == 0
+    assert len(calls) == 1  # only new.mp4 repaired
+    assert "new.retimed.mp4" in " ".join(calls[0])
+    assert "range: 2026-10-11 -> end" in text
+    assert "(excluded 1 session(s) outside the range)" in text
+
+
+def test_main_to_one_sided(tmp_path):
+    log, probe = _two_day_log(tmp_path)
+    calls = []
+    code, _ = run_main(
+        ["--log", str(log), "--to", "2026-10-10"],
+        probe, make_run(calls))
+    assert code == 0
+    assert len(calls) == 1
+    assert "old.retimed.mp4" in " ".join(calls[0])
+
+
+def test_main_garbage_date_is_usage_error(tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        retime_all.main(["--from", "not-a-date"])
+    assert exc_info.value.code == 2
+
+
+def test_main_from_after_to_is_usage_error(tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        retime_all.main(["--from", "2026-10-11", "--to", "2026-10-10"])
+    assert exc_info.value.code == 2
+
+
+def test_main_json_carries_date_bounds(tmp_path):
+    log, probe = _two_day_log(tmp_path)
+    code, text = run_main(
+        ["--log", str(log), "--from", "2026-10-10", "--to", "2026-10-11",
+         "--json"],
+        probe, make_run([]))
+    assert code == 0
+    payload = json.loads(text)
+    assert payload["date_from"] == "2026-10-10"
+    assert payload["date_to"] == "2026-10-11"
+    assert payload["out_of_range"] == 0
+    assert payload["undated_excluded"] == 0
+    assert payload["sped_up"] == 2
+
+
+def test_format_text_shows_range_and_exclusions(tmp_path):
+    from datetime import date
+    text = retime_all.format_text(
+        [], tmp_path / "sessions.jsonl", 0,
+        date(2026, 10, 1), date(2026, 10, 10),
+        out_of_range=2, undated_excluded=1)
+    assert "range: 2026-10-01 -> 2026-10-10" in text
+    assert "(excluded 2 session(s) outside the range)" in text
+    assert "(excluded 1 session(s) with no usable date)" in text
