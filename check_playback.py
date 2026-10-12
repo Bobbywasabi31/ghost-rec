@@ -13,6 +13,7 @@ and flags drift in either direction:
     python check_playback.py --video-dir path\\to\\clips   # MP4s live elsewhere
     python check_playback.py --tolerance 5    # relative drift tolerance, percent
     python check_playback.py --json           # machine-readable report
+    python check_playback.py --csv            # spreadsheet-friendly CSV
     python check_playback.py --from 2026-10-01 --to 2026-10-10  # date range
 
 Video probing uses the ffmpeg binary bundled with imageio-ffmpeg (already a
@@ -27,11 +28,16 @@ Exit codes: 0 = every checkable session is within tolerance (or nothing was
 checkable), 1 = at least one session drifted beyond tolerance, 2 = usage
 error. Bad log lines are skipped and counted, never fatal -- same stance as
 sessions_summary.py.
+
+Notes (log path, skipped lines, active filters) go to stderr under --csv so
+stdout stays pure CSV; --json and --csv cannot be combined.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import re
 import subprocess
@@ -229,6 +235,36 @@ def format_text(results: list[dict], log_path: Path, skipped: int,
     return "\n".join(lines) + "\n"
 
 
+def format_csv(results: list[dict]) -> str:
+    """Render the per-session results as a spreadsheet-friendly CSV.
+
+    One header row (file,status,video_s,duration_s,drift_ratio), then one
+    row per checked session. Durations are one-decimal seconds; drift_ratio
+    is video_s / duration_s (3 decimals, empty when either side is
+    unusable -- MISSING/UNREADABLE/NO_FILE/NO_DURATION). Plain decimals so
+    spreadsheets and pandas parse cleanly; stdlib csv handles quoting, so
+    commas in filenames round-trip.
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["file", "status", "video_s", "duration_s", "drift_ratio"])
+    for row in results:
+        video = row["video_s"]
+        expected = row["duration_s"]
+        if video is None or expected is None:
+            ratio = ""
+        else:
+            ratio = f"{video / expected:.3f}"
+        writer.writerow([
+            row["file"] or "",
+            row["status"],
+            f"{video:.1f}" if video is not None else "",
+            f"{expected:.1f}" if expected is not None else "",
+            ratio,
+        ])
+    return buf.getvalue()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Verify ghost-rec clips play back at real-time speed "
@@ -251,7 +287,12 @@ def main(argv: list[str] | None = None) -> int:
                         "YYYY-MM-DD")
     parser.add_argument("--json", action="store_true",
                         help="machine-readable JSON report on stdout")
+    parser.add_argument("--csv", action="store_true",
+                        help="print the results as CSV (notes go to stderr "
+                        "so stdout stays pure)")
     args = parser.parse_args(argv)
+    if args.json and args.csv:
+        parser.error("--json and --csv cannot be combined")
     if args.tolerance < 0:
         parser.error("--tolerance must be >= 0")
     date_from = date_to = None
@@ -284,6 +325,22 @@ def main(argv: list[str] | None = None) -> int:
         }
         json.dump(payload, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
+    elif args.csv:
+        sys.stdout.write(format_csv(results))
+        notes = [f"log: {args.log}"]
+        if date_from is not None or date_to is not None:
+            lo = date_from.isoformat() if date_from else "beginning"
+            hi = date_to.isoformat() if date_to else "end"
+            notes.append(f"range: {lo} -> {hi}")
+        if skipped:
+            notes.append(f"skipped {skipped} unreadable line(s)")
+        if out_of_range:
+            notes.append(
+                f"excluded {out_of_range} session(s) outside the range")
+        if undated_excluded:
+            notes.append(
+                f"excluded {undated_excluded} session(s) with no usable date)")
+        sys.stderr.write("\n".join(notes) + "\n")
     else:
         sys.stdout.write(format_text(results, args.log, skipped,
                                      date_from, date_to,

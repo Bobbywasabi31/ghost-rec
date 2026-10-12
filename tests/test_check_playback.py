@@ -9,6 +9,7 @@ both CI runners (imageio + imageio-ffmpeg are ghost-rec dependencies).
 """
 
 import io
+import csv
 import json
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -366,3 +367,100 @@ def test_main_from_after_to_exits_2(tmp_path, capsys):
         check_playback.main(["--from", "2026-10-12", "--to", "2026-10-10"])
     assert excinfo.value.code == 2
     assert "--from" in capsys.readouterr().err
+
+
+# --- --csv output ----------------------------------------------------------
+
+def csv_result(file="clip.mp4", status="OK", video_s=57.0, duration_s=60.0):
+    return {"file": file, "status": status, "video_s": video_s,
+            "duration_s": duration_s, "note": ""}
+
+
+def parse_csv(text):
+    return list(csv.reader(io.StringIO(text)))
+
+
+def test_format_csv_header_and_rows():
+    rows = [
+        csv_result(file="good.mp4", status="OK", video_s=57.0,
+                   duration_s=60.0),
+        csv_result(file="fast.mp4", status="SPED_UP", video_s=6.0,
+                   duration_s=240.0),
+        csv_result(file="gone.mp4", status="MISSING", video_s=None,
+                   duration_s=60.0),
+        csv_result(status="NO_FILE", file=None, video_s=None,
+                   duration_s=60.0),
+    ]
+    parsed = parse_csv(check_playback.format_csv(rows))
+    assert parsed[0] == ["file", "status", "video_s", "duration_s",
+                         "drift_ratio"]
+    assert ["good.mp4", "OK", "57.0", "60.0", "0.950"] in parsed[1:]
+    assert ["fast.mp4", "SPED_UP", "6.0", "240.0", "0.025"] in parsed[1:]
+    assert ["gone.mp4", "MISSING", "", "60.0", ""] in parsed[1:]
+    assert ["", "NO_FILE", "", "60.0", ""] in parsed[1:]
+
+
+def test_format_csv_filename_with_comma_roundtrips():
+    parsed = parse_csv(check_playback.format_csv(
+        [csv_result(file="odd,name,2026.mp4", video_s=10.0,
+                    duration_s=10.0)]))
+    assert ["odd,name,2026.mp4", "OK", "10.0", "10.0", "1.000"] in parsed[1:]
+
+
+def test_format_csv_empty_results():
+    parsed = parse_csv(check_playback.format_csv([]))
+    assert parsed == [["file", "status", "video_s", "duration_s",
+                       "drift_ratio"]]
+
+
+def test_main_csv_notes_on_stderr(tmp_path, capsys):
+    touch(tmp_path / "a.mp4")
+    touch(tmp_path / "b.mp4")
+    log = write_log_with(tmp_path, [
+        {"start": "2026-10-11T10:00:00", "file": "a.mp4", "duration_s": 60.0},
+        {"start": "2026-10-09T10:00:00", "file": "b.mp4", "duration_s": 60.0},
+        "garbage",  # bad line: skipped + counted
+    ])
+    args = ["--log", str(log), "--video-dir", str(tmp_path), "--csv",
+            "--from", "2026-10-11"]
+    # canned probes: a.mp4 probes fine, so use a real zero-byte file -> the
+    # real probe can't parse it, which exercises UNREADABLE end-to-end.
+    code = check_playback.main(args)
+    captured = capsys.readouterr()
+    assert code == 0  # UNREADABLE is not drift
+    rows = parse_csv(captured.out)
+    assert rows[0] == ["file", "status", "video_s", "duration_s",
+                       "drift_ratio"]
+    assert len(rows) == 2  # header + the one in-range session
+    assert rows[1][0] == "a.mp4"
+    # notes stay on stderr, stdout stays pure CSV
+    assert f"log: {log}" in captured.err
+    assert "range: 2026-10-11 -> end" in captured.err
+    assert "skipped 1 unreadable line(s)" in captured.err
+    assert "excluded 1 session(s) outside the range" in captured.err
+    assert "range:" not in captured.out
+
+
+def test_main_csv_drift_still_exits_1(tmp_path, capsys):
+    # Real 0.5s clip logged as a 240s session -> SPED_UP end-to-end.
+    write_clip(tmp_path / "fast.mp4", frames=30, fps=60)
+    log = write_log_with(tmp_path, [
+        {"start": "2026-10-11T10:00:00", "file": "fast.mp4",
+         "duration_s": 240.0},
+    ])
+    code = check_playback.main(["--log", str(log), "--video-dir",
+                                str(tmp_path), "--csv"])
+    captured = capsys.readouterr()
+    assert code == 1
+    rows = parse_csv(captured.out)
+    assert rows[0] == ["file", "status", "video_s", "duration_s",
+                       "drift_ratio"]
+    assert len(rows) == 2
+    assert rows[1][0] == "fast.mp4" and rows[1][1] == "SPED_UP"
+
+
+def test_main_json_csv_conflict_exits_2(tmp_path, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        check_playback.main(["--json", "--csv"])
+    assert excinfo.value.code == 2
+    assert "cannot be combined" in capsys.readouterr().err
