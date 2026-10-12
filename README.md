@@ -96,7 +96,13 @@ python check_playback.py --log path\to\sessions.jsonl
 python check_playback.py --video-dir path\to\clips   # MP4s live elsewhere
 python check_playback.py --tolerance 5    # relative drift tolerance, percent
 python check_playback.py --json           # machine-readable report
+python check_playback.py --from 2026-10-01 --to 2026-10-10  # date range
 ```
+
+`--from`/`--to` (inclusive YYYY-MM-DD, one-sided ok) limit the check to
+sessions starting in the range — same filter as `sessions_summary.py`.
+Sessions outside the range aren't probed, and sessions with no usable
+start date are excluded (and counted) while filtering.
 
 MP4s are assumed to sit next to the log file unless `--video-dir` says
 otherwise. Drift tolerance defaults to 10% with a 2-second absolute floor

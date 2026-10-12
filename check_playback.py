@@ -13,9 +13,15 @@ and flags drift in either direction:
     python check_playback.py --video-dir path\\to\\clips   # MP4s live elsewhere
     python check_playback.py --tolerance 5    # relative drift tolerance, percent
     python check_playback.py --json           # machine-readable report
+    python check_playback.py --from 2026-10-01 --to 2026-10-10  # date range
 
 Video probing uses the ffmpeg binary bundled with imageio-ffmpeg (already a
 ghost-rec dependency); the file itself is never decoded frame-by-frame.
+
+The date range filters by session start day (inclusive, one-sided ok),
+mirroring sessions_summary.py: sessions outside the range are not checked,
+and sessions with no usable start date are excluded (and counted) whenever
+a bound is set.
 
 Exit codes: 0 = every checkable session is within tolerance (or nothing was
 checkable), 1 = at least one session drifted beyond tolerance, 2 = usage
@@ -32,7 +38,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from sessions_summary import load_entries
+from sessions_summary import _parse_day, filter_entries_by_date, load_entries
 
 DEFAULT_LOG = Path.home() / "Videos" / "ghost" / "sessions.jsonl"
 
@@ -168,21 +174,44 @@ def check_log(
     probe=probe_video_duration,
     rel_tol: float = 0.10,
     abs_floor: float = 2.0,
-) -> tuple[list[dict], int]:
-    """Check every entry in *log_path*; return (results, skipped_lines)."""
+    date_from=None,
+    date_to=None,
+) -> tuple[list[dict], int, int, int]:
+    """Check the log's entries; return (results, skipped, out_of_range,
+    undated_excluded).
+
+    When date_from/date_to are set, only entries whose start day falls
+    within [date_from, date_to] are checked; entries outside the range
+    count as out_of_range, and undated entries count as undated_excluded.
+    """
     entries, skipped = load_entries(log_path)
+    entries, out_of_range, undated_excluded = filter_entries_by_date(
+        entries, date_from, date_to
+    )
     results = [
         check_entry(entry, video_dir, probe, rel_tol, abs_floor)
         for entry in entries
     ]
-    return results, skipped
+    return results, skipped, out_of_range, undated_excluded
 
 
-def format_text(results: list[dict], log_path: Path, skipped: int) -> str:
+def format_text(results: list[dict], log_path: Path, skipped: int,
+                date_from=None, date_to=None,
+                out_of_range: int = 0, undated_excluded: int = 0) -> str:
     """Render a human-readable report."""
     lines = [f"playback check: {log_path}"]
+    if date_from is not None or date_to is not None:
+        lo = date_from.isoformat() if date_from else "beginning"
+        hi = date_to.isoformat() if date_to else "end"
+        lines.append(f"  range: {lo} -> {hi}")
     if skipped:
         lines.append(f"  (skipped {skipped} unreadable log line(s))")
+    if out_of_range:
+        lines.append(f"  (excluded {out_of_range} session(s) outside the range)")
+    if undated_excluded:
+        lines.append(
+            f"  (excluded {undated_excluded} session(s) with no usable date)"
+        )
     counts: dict[str, int] = {}
     for row in results:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
@@ -214,14 +243,30 @@ def main(argv: list[str] | None = None) -> int:
                         help="relative drift tolerance in percent "
                         "(default: %(default)s); a 2s absolute floor "
                         "always applies")
+    parser.add_argument("--from", dest="date_from", default=None,
+                        help="only check sessions starting on/after "
+                        "YYYY-MM-DD")
+    parser.add_argument("--to", dest="date_to", default=None,
+                        help="only check sessions starting on/before "
+                        "YYYY-MM-DD")
     parser.add_argument("--json", action="store_true",
                         help="machine-readable JSON report on stdout")
     args = parser.parse_args(argv)
     if args.tolerance < 0:
         parser.error("--tolerance must be >= 0")
+    date_from = date_to = None
+    if args.date_from or args.date_to:
+        try:
+            date_from = _parse_day(args.date_from) if args.date_from else None
+            date_to = _parse_day(args.date_to) if args.date_to else None
+        except ValueError as exc:
+            parser.error(str(exc))
+        if date_from and date_to and date_from > date_to:
+            parser.error(f"--from {date_from} is after --to {date_to}")
     video_dir = args.video_dir or args.log.parent
-    results, skipped = check_log(
-        args.log, video_dir, rel_tol=args.tolerance / 100.0
+    results, skipped, out_of_range, undated_excluded = check_log(
+        args.log, video_dir, rel_tol=args.tolerance / 100.0,
+        date_from=date_from, date_to=date_to,
     )
     drifted = [r for r in results if r["status"] in ("SPED_UP", "STRETCHED")]
     if args.json:
@@ -230,13 +275,19 @@ def main(argv: list[str] | None = None) -> int:
             "video_dir": str(video_dir),
             "tolerance_pct": args.tolerance,
             "skipped_lines": skipped,
+            "date_from": date_from.isoformat() if date_from else None,
+            "date_to": date_to.isoformat() if date_to else None,
+            "out_of_range": out_of_range,
+            "undated_excluded": undated_excluded,
             "sessions": results,
             "drifted": len(drifted),
         }
         json.dump(payload, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
     else:
-        sys.stdout.write(format_text(results, args.log, skipped))
+        sys.stdout.write(format_text(results, args.log, skipped,
+                                     date_from, date_to,
+                                     out_of_range, undated_excluded))
     return 1 if drifted else 0
 
 

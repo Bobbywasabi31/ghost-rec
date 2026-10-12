@@ -56,8 +56,8 @@ def find_sped_up(
     video_s, status, note) -- only the SPED_UP ones. STRETCHED clips are
     deliberately excluded (see module docstring).
     """
-    results, skipped = check_log(log_path, video_dir, probe,
-                                 rel_tol=rel_tol, abs_floor=abs_floor)
+    results, skipped, _out_of_range, _undated_excluded = check_log(
+        log_path, video_dir, probe, rel_tol=rel_tol, abs_floor=abs_floor)
     return [r for r in results if r["status"] == "SPED_UP"], skipped
 
 
