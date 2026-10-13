@@ -597,3 +597,78 @@ def test_main_json_and_csv_conflict_is_usage_error():
     with pytest.raises(SystemExit) as exc_info:
         retime_all.main(["--json", "--csv"])
     assert exc_info.value.code == 2
+
+
+# --- --days N shortcut -------------------------------------------------------
+
+def days_ago_entry(days_ago, file):
+    from datetime import date, timedelta
+    day = (date.today() - timedelta(days=days_ago)).isoformat()
+    return entry(file=file, start=f"{day}T12:00:00")
+
+
+def test_main_days_repairs_only_last_n_days(tmp_path):
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [
+        days_ago_entry(0, "today.mp4"),
+        days_ago_entry(6, "six-ago.mp4"),
+        days_ago_entry(8, "eight-ago.mp4"),
+    ])
+    for name in ("today.mp4", "six-ago.mp4", "eight-ago.mp4"):
+        touch(tmp_path / name)
+    probe = canned_probe({"today.mp4": 6.0, "six-ago.mp4": 6.0,
+                          "eight-ago.mp4": 6.0})
+    calls = []
+    code, text = run_main(["--log", str(log), "--days", "7"], probe,
+                          make_run(calls))
+    assert code == 0
+    assert len(calls) == 2  # today.mp4 + six-ago.mp4; eight-ago excluded
+    cmdline = " ".join(" ".join(c) for c in calls)
+    assert "today.retimed.mp4" in cmdline
+    assert "eight-ago.retimed.mp4" not in cmdline
+    from datetime import date, timedelta
+    lo = (date.today() - timedelta(days=6)).isoformat()
+    hi = date.today().isoformat()
+    assert f"range: {lo} -> {hi}" in text
+
+
+def test_main_from_overrides_days_lower_bound(tmp_path):
+    from datetime import date, timedelta
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [
+        days_ago_entry(0, "today.mp4"),
+        days_ago_entry(1, "yesterday.mp4"),
+        days_ago_entry(6, "six-ago.mp4"),
+    ])
+    for name in ("today.mp4", "yesterday.mp4", "six-ago.mp4"):
+        touch(tmp_path / name)
+    probe = canned_probe({"today.mp4": 6.0, "yesterday.mp4": 6.0,
+                          "six-ago.mp4": 6.0})
+    calls = []
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    code, _ = run_main(["--log", str(log), "--days", "7", "--from", yesterday],
+                       probe, make_run(calls))
+    assert code == 0
+    assert len(calls) == 2  # today.mp4 + yesterday.mp4; six-ago excluded
+
+
+def test_main_days_json_reports_resolved_bounds(tmp_path):
+    from datetime import date, timedelta
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [days_ago_entry(0, "today.mp4")])
+    touch(tmp_path / "today.mp4")
+    probe = canned_probe({"today.mp4": 6.0})
+    code, text = run_main(["--log", str(log), "--json", "--days", "3"],
+                          probe, make_run([]))
+    assert code == 0
+    payload = json.loads(text)
+    assert (payload["date_from"]
+            == (date.today() - timedelta(days=2)).isoformat())
+    assert payload["date_to"] == date.today().isoformat()
+
+
+@pytest.mark.parametrize("bad", ["abc", "0", "-5"])
+def test_main_bad_days_exits_2(bad):
+    with pytest.raises(SystemExit) as exc_info:
+        retime_all.main(["--days", bad])
+    assert exc_info.value.code == 2

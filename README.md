@@ -162,11 +162,15 @@ python retime_all.py --force          # overwrite existing .retimed.mp4s
 python retime_all.py --json           # machine-readable report
 python retime_all.py --csv            # per-clip results as CSV (notes go to stderr so stdout stays pure)
 python retime_all.py --from 2026-10-01 --to 2026-10-10  # only repair clips recorded in that date range (session start day, inclusive)
+python retime_all.py --days 7       # last 7 days including today
 ```
 
 Exit code is 0 when there was nothing to repair or every repair
 succeeded, 1 when at least one repair failed or was refused (details in
-the report), 2 on a usage error.
+the report), 2 on a usage error. `--days N` (N ≥ 1) is shorthand for the
+last N days including today and just fills whichever bound an explicit
+`--from`/`--to` doesn't set, mirroring `check_playback.py`; garbage
+`--days` values exit 2.
 
 ## Audio (optional, off by default)
 

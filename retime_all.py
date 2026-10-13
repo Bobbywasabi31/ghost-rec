@@ -16,6 +16,7 @@ its logged duration in a single run:
     python retime_all.py --json           # machine-readable report
     python retime_all.py --csv            # spreadsheet-friendly CSV
     python retime_all.py --from 2026-10-01 --to 2026-10-10  # date range
+    python retime_all.py --days 7          # last 7 days including today
 
 The date range filters by session start day (inclusive, one-sided ok),
 mirroring ``check_playback.py``: sessions starting outside the range are
@@ -48,7 +49,7 @@ from pathlib import Path
 
 from check_playback import check_log, probe_video_duration
 from retime_clip import ABS_FLOOR, REL_TOL, _ffmpeg_run, resolve_output, retime
-from sessions_summary import _parse_day
+from sessions_summary import _parse_day, resolve_days_range
 
 DEFAULT_LOG = Path.home() / "Videos" / "ghost" / "sessions.jsonl"
 
@@ -213,6 +214,10 @@ def main(
     parser.add_argument("--to", dest="date_to", default=None,
                         help="only repair sessions starting on/before "
                         "YYYY-MM-DD")
+    parser.add_argument("--days", default=None,
+                        help="only repair sessions starting in the last N "
+                        "days including today; fills whichever bound an "
+                        "explicit --from/--to doesn't set")
     parser.add_argument("--json", action="store_true",
                         help="machine-readable JSON report on stdout")
     parser.add_argument("--csv", action="store_true",
@@ -223,11 +228,22 @@ def main(
         parser.error("--json and --csv cannot be combined")
     if args.tolerance < 0:
         parser.error("--tolerance must be >= 0")
-    date_from = date_to = None
-    if args.date_from or args.date_to:
+    # --days supplies defaults; explicit --from/--to override whichever
+    # bound they name, so e.g. --from 2026-10-01 --days 30 repairs that
+    # day through today.
+    days_from = days_to = None
+    if args.days is not None:
         try:
-            date_from = _parse_day(args.date_from) if args.date_from else None
-            date_to = _parse_day(args.date_to) if args.date_to else None
+            days_from, days_to = resolve_days_range(args.days)
+        except ValueError as exc:
+            parser.error(str(exc))
+    date_from = date_to = None
+    if args.date_from or args.date_to or days_from is not None:
+        try:
+            date_from = (_parse_day(args.date_from) if args.date_from
+                         else days_from)
+            date_to = (_parse_day(args.date_to) if args.date_to
+                       else days_to)
         except ValueError as exc:
             parser.error(str(exc))
         if date_from and date_to and date_from > date_to:
