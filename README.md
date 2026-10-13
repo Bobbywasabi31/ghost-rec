@@ -135,6 +135,7 @@ python retime_clip.py clip.mp4 --duration 300
 python retime_clip.py clip.mp4 --output fixed.mp4
 python retime_clip.py clip.mp4 --dry-run      # print the ffmpeg command
 python retime_clip.py clip.mp4 --force        # overwrite output / allow extreme stretch
+python retime_clip.py clip.mp4 --json         # machine-readable result on stdout (pure JSON)
 ```
 
 Safety rails: refuses to write over the input or an existing output
@@ -142,6 +143,9 @@ without `--force`; does nothing when the clip already plays at real time
 (same 10%/2s tolerance as `check_playback`); and treats a stretch factor
 beyond 120x as a probable bad log entry, requiring `--force`. Exit code
 is 1 when the clip can't be probed or ffmpeg fails, 2 on a usage error.
+The `--json` payload carries `clip`, `output`, `target_s`, `exit_code`,
+`encoded_s`, `stretch_factor`, and `message` — mirroring the other
+report tools in this family.
 
 `retime_all.py` (issue #1 follow-up) repairs *every* clip that
 `check_playback.py` flags `SPED_UP` in one pass — for when more than one

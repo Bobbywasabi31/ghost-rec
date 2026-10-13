@@ -281,6 +281,125 @@ def test_main_missing_clip_exits_2(tmp_path):
     assert exc.value.code == 2
 
 
+# --- --json output ---------------------------------------------------------
+
+def _run_json(tmp_path, argv, **main_kwargs):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = retime_clip.main(argv, **main_kwargs)
+    return code, json.loads(buf.getvalue())
+
+
+def test_json_success_carries_fields(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    out = tmp_path / "fixed.mp4"
+    calls = []
+    code, payload = _run_json(
+        tmp_path,
+        [str(clip), "--duration", "600", "--output", str(out), "--json"],
+        probe=canned_probe(6.0), run=make_run(calls),
+    )
+    assert code == 0
+    assert payload == {
+        "clip": str(clip),
+        "output": str(out),
+        "target_s": 600.0,
+        "dry_run": False,
+        "exit_code": 0,
+        "encoded_s": 6.0,
+        "stretch_factor": pytest.approx(100.0),
+        "message": payload["message"],
+    }
+    assert len(calls) == 1
+
+
+def test_json_dry_run_marks_dry_run_and_factor(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    code, payload = _run_json(
+        tmp_path,
+        [str(clip), "--duration", "240", "--json", "--dry-run"],
+        probe=canned_probe(6.0),
+    )
+    assert code == 0
+    assert payload["dry_run"] is True
+    assert payload["encoded_s"] == 6.0
+    assert payload["stretch_factor"] == pytest.approx(40.0)
+    assert payload["exit_code"] == 0
+    assert "setpts=40.000000*PTS" in payload["message"]
+
+
+def test_json_already_realtime_has_null_factor(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    code, payload = _run_json(
+        tmp_path,
+        [str(clip), "--duration", "60", "--json"],
+        probe=canned_probe(58.0),
+    )
+    assert code == 0
+    assert payload["exit_code"] == 0
+    assert payload["encoded_s"] == 58.0
+    assert payload["stretch_factor"] is None
+    assert "nothing to do" in payload["message"]
+
+
+def test_json_failure_payload_is_still_parseable(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    code, payload = _run_json(
+        tmp_path,
+        [str(clip), "--duration", "60", "--json"],
+        probe=canned_probe(None),
+    )
+    assert code == 1
+    assert payload["exit_code"] == 1
+    assert payload["encoded_s"] is None
+    assert payload["stretch_factor"] is None
+    assert payload["message"]
+
+
+def test_json_insane_factor_guard_payload(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    calls = []
+    code, payload = _run_json(
+        tmp_path,
+        [str(clip), "--duration", "10000", "--json"],
+        probe=canned_probe(1.0), run=make_run(calls),
+    )
+    assert code == 2
+    assert payload["exit_code"] == 2
+    assert payload["encoded_s"] == 1.0
+    assert "insane" in payload["message"]
+    assert calls == []
+
+
+def test_retime_without_details_keeps_two_tuple_contract(tmp_path):
+    # retime_all unpacks (code, message); the details out-param must stay
+    # opt-in only.
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    result = retime_clip.retime(
+        clip, 240.0, tmp_path / "out.mp4", dry_run=True,
+        probe=canned_probe(6.0),
+    )
+    assert isinstance(result, tuple) and len(result) == 2
+
+
+def test_json_stdout_is_pure_json(tmp_path, capsys):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    code = retime_clip.main(
+        [str(clip), "--duration", "60", "--json"], probe=canned_probe(58.0)
+    )
+    assert code == 0
+    out, err = capsys.readouterr()
+    json.loads(out)  # raises if anything non-JSON reached stdout
+    assert err == ""
+
+
 # --- end to end (real bundled ffmpeg) --------------------------------------
 
 def _write_issue1_shape_clip(path: Path, with_audio: bool):

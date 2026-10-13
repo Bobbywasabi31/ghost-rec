@@ -18,10 +18,16 @@ restores A/V sync. The input file is never modified; a new file is written.
     python retime_clip.py clip.mp4 --output fixed.mp4
     python retime_clip.py clip.mp4 --dry-run      # print the ffmpeg command
     python retime_clip.py clip.mp4 --force        # overwrite output / allow extreme stretch
+    python retime_clip.py clip.mp4 --json         # machine-readable result on stdout
 
 The ffmpeg binary bundled with imageio-ffmpeg (already a ghost-rec
 dependency) does the re-encode; CREATE_NO_WINDOW is used on Windows so no
 console flashes.
+
+With --json the payload (clip, output, target_s, exit_code, encoded_s,
+stretch_factor, message) goes to stdout as pure JSON, mirroring the other
+ghost-rec report tools; without it, the human-readable message goes to
+stdout on success and stderr on failure.
 
 Exit codes: 0 = repaired (or already real time, nothing to do),
 1 = the clip couldn't be probed or ffmpeg failed,
@@ -31,6 +37,7 @@ Exit codes: 0 = repaired (or already real time, nothing to do),
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -139,13 +146,22 @@ def retime(input_path: Path, target_s: float, output_path: Path,
            probe=probe_video_duration,
            run=_ffmpeg_run,
            rel_tol: float = REL_TOL,
-           abs_floor: float = ABS_FLOOR) -> tuple[int, str]:
+           abs_floor: float = ABS_FLOOR,
+           details: dict | None = None) -> tuple[int, str]:
     """Repair one clip; return (exit_code, human-readable message).
 
     rel_tol/abs_floor shape the already-real-time no-op gate; batch callers
     (retime_all) pass the selection tolerance so a flagged clip is actually
     repaired instead of no-op'd.
+
+    When ``details`` is a dict it is filled with ``encoded_s`` (the probed
+    playback length, or None), ``stretch_factor`` (the setpts multiplier
+    applied, or None when nothing was stretched), and ``output`` (the
+    resolved output path) -- used by main() for the --json payload.
     """
+    if details is not None:
+        details.update(encoded_s=None, stretch_factor=None,
+                       output=str(output_path))
     if output_path.exists() and not force:
         return 2, (
             f"{output_path} already exists -- pass --force to overwrite "
@@ -156,6 +172,8 @@ def retime(input_path: Path, target_s: float, output_path: Path,
     encoded_s = probe(input_path)
     if encoded_s is None:
         return 1, f"could not probe a video duration from {input_path}"
+    if details is not None:
+        details["encoded_s"] = encoded_s
     if already_realtime(encoded_s, target_s, rel_tol, abs_floor):
         return 0, (
             f"{input_path.name} already plays at real time "
@@ -173,6 +191,8 @@ def retime(input_path: Path, target_s: float, output_path: Path,
         return 1, "ffmpeg binary unavailable (imageio-ffmpeg not installed?)"
     cmd = build_command(exe, input_path, output_path, factor)
     if dry_run:
+        if details is not None:
+            details["stretch_factor"] = factor
         return 0, " ".join(cmd)
     try:
         proc = run(cmd)
@@ -183,6 +203,8 @@ def retime(input_path: Path, target_s: float, output_path: Path,
         return 1, "ffmpeg failed:\n" + "\n".join(tail)
     out_s = probe(output_path)
     out_note = f"{out_s:.1f}s" if out_s is not None else "unprobable"
+    if details is not None:
+        details["stretch_factor"] = factor
     return 0, (
         f"{input_path.name}: {encoded_s:.1f}s -> {out_note} "
         f"({factor:.1f}x stretch), wrote {output_path}"
@@ -210,6 +232,9 @@ def main(argv: list[str] | None = None,
                         "extreme stretch factors")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the ffmpeg command without running it")
+    parser.add_argument("--json", action="store_true",
+                        help="machine-readable JSON result on stdout "
+                        "(stdout stays pure JSON)")
     args = parser.parse_args(argv)
 
     if not args.clip.is_file():
@@ -227,10 +252,24 @@ def main(argv: list[str] | None = None,
             )
 
     output_path = resolve_output(args.clip, args.output)
+    details: dict = {}
     code, message = retime(args.clip, target_s, output_path,
                            force=args.force, dry_run=args.dry_run,
-                           probe=probe, run=run)
-    if code == 0:
+                           probe=probe, run=run, details=details)
+    if args.json:
+        payload = {
+            "clip": str(args.clip),
+            "output": details["output"],
+            "target_s": target_s,
+            "dry_run": args.dry_run,
+            "exit_code": code,
+            "encoded_s": details["encoded_s"],
+            "stretch_factor": details["stretch_factor"],
+            "message": message,
+        }
+        json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+    elif code == 0:
         print(message)
     else:
         print(f"retime_clip: {message}", file=sys.stderr)
