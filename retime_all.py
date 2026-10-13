@@ -13,6 +13,8 @@ its logged duration in a single run:
     python retime_all.py --tolerance 5    # drift tolerance, percent
     python retime_all.py --dry-run        # report only, run no ffmpeg
     python retime_all.py --force          # overwrite existing .retimed.mp4s
+    python retime_all.py --verify         # re-probe each repaired output and
+                                          # confirm it plays at real time
     python retime_all.py --json           # machine-readable report
     python retime_all.py --csv            # spreadsheet-friendly CSV
     python retime_all.py --from 2026-10-01 --to 2026-10-10  # date range
@@ -33,9 +35,17 @@ alone on purpose -- the issue #1 symptom was speed-up, and shrinking a
 stretched clip could destroy legitimate content.
 
 Exit codes: 0 = nothing to repair, or every repair succeeded;
-1 = at least one repair failed (details in the report); 2 = usage error.
+1 = at least one repair failed (details in the report), or a repaired
+clip still drifts from its target after --verify; 2 = usage error.
 Bad log lines are skipped and counted, never fatal -- same stance as the
 sibling tools.
+
+With --verify, each repaired output is re-probed and checked against the
+logged wall-clock duration (same tolerance): "verified" means it now
+plays at real time, "drifted" means the repair didn't land (also an
+exit-1 failure), "unprobable" means the output couldn't be probed, and
+"skipped" covers nothing-to-verify cases (failed repair, --dry-run, or
+no output file written).
 """
 
 from __future__ import annotations
@@ -48,7 +58,8 @@ import sys
 from pathlib import Path
 
 from check_playback import check_log, probe_video_duration
-from retime_clip import ABS_FLOOR, REL_TOL, _ffmpeg_run, resolve_output, retime
+from retime_clip import (ABS_FLOOR, REL_TOL, _ffmpeg_run, already_realtime,
+                         resolve_output, retime)
 from sessions_summary import _parse_day, resolve_days_range
 
 DEFAULT_LOG = Path.home() / "Videos" / "ghost" / "sessions.jsonl"
@@ -131,9 +142,71 @@ def summarize(outcomes: list[dict]) -> dict:
     return counts
 
 
+def verify_repairs(
+    results: list[dict],
+    outcomes: list[dict],
+    probe=probe_video_duration,
+    dry_run: bool = False,
+    rel_tol: float = REL_TOL,
+    abs_floor: float = ABS_FLOOR,
+) -> list[dict]:
+    """Re-probe each repaired output; confirm it now plays at real time.
+
+    One verification dict per (result, outcome) pair, in the same order:
+    {"file", "output", "status", "video_s", "note"}. Status is "verified"
+    when the output probes within the batch tolerance of the logged
+    duration_s, "drifted" when it probes outside it (the repair didn't
+    land), "unprobable" when the output can't be probed, and "skipped"
+    when there is nothing to verify (failed repair, dry run, or no output
+    file was written). rel_tol/abs_floor mirror the selection and repair
+    gates so a repaired clip is judged by the same tolerance.
+    """
+    verifications = []
+    for result, outcome in zip(results, outcomes):
+        output_path = Path(outcome["output"])
+        video_s = None
+        if dry_run:
+            status, note = "skipped", "--dry-run wrote no files"
+        elif outcome["code"] != 0:
+            status, note = "skipped", "repair did not succeed"
+        elif not output_path.exists():
+            status, note = "skipped", "no output file was written"
+        else:
+            video_s = probe(output_path)
+            target_s = result["duration_s"]
+            if video_s is None:
+                status = "unprobable"
+                note = f"could not probe {output_path.name}"
+            elif already_realtime(video_s, target_s, rel_tol, abs_floor):
+                status = "verified"
+                note = (f"{output_path.name} plays at {video_s:.1f}s vs "
+                        f"{target_s:.1f}s target -- real time")
+            else:
+                status = "drifted"
+                note = (f"{output_path.name} plays at {video_s:.1f}s vs "
+                        f"{target_s:.1f}s target -- still drifted")
+        verifications.append({
+            "file": result["file"],
+            "output": outcome["output"],
+            "status": status,
+            "video_s": video_s,
+            "note": note,
+        })
+    return verifications
+
+
+def summarize_verify(verifications: list[dict]) -> dict:
+    """Count verification results by status."""
+    counts = {"verified": 0, "drifted": 0, "unprobable": 0, "skipped": 0}
+    for verification in verifications:
+        counts[verification["status"]] += 1
+    return counts
+
+
 def format_text(outcomes: list[dict], log_path: Path, skipped: int,
                 date_from=None, date_to=None,
-                out_of_range: int = 0, undated_excluded: int = 0) -> str:
+                out_of_range: int = 0, undated_excluded: int = 0,
+                verifications: list[dict] | None = None) -> str:
     """Render a human-readable report."""
     lines = [f"batch repair: {log_path}"]
     if date_from is not None or date_to is not None:
@@ -161,6 +234,20 @@ def format_text(outcomes: list[dict], log_path: Path, skipped: int,
         f"{counts['failed']} failed, "
         f"{counts['skipped_or_refused']} skipped/refused"
     )
+    if verifications:
+        vcounts = summarize_verify(verifications)
+        lines.append(
+            f"verify: {vcounts['verified']} verified, "
+            f"{vcounts['drifted']} drifted, "
+            f"{vcounts['unprobable']} unprobable, "
+            f"{vcounts['skipped']} skipped"
+        )
+        for verification in verifications:
+            if verification["status"] == "verified":
+                continue
+            lines.append(f"  [{verification['status'].upper()}] "
+                         f"{verification['file']}")
+            lines.append(f"               {verification['note']}")
     return "\n".join(lines) + "\n"
 
 
@@ -205,6 +292,9 @@ def main(
     parser.add_argument("--force", action="store_true",
                         help="overwrite existing .retimed.mp4 outputs; also "
                         "allow extreme stretch factors")
+    parser.add_argument("--verify", action="store_true",
+                        help="re-probe each repaired output and confirm it "
+                        "plays at real time (exit 1 when one still drifts)")
     parser.add_argument("--dry-run", action="store_true",
                         help="report what would be repaired without running "
                         "ffmpeg")
@@ -260,6 +350,14 @@ def main(
         probe=probe, run=run, rel_tol=rel_tol,
     )
     counts = summarize(outcomes)
+    verifications = None
+    if args.verify and outcomes:
+        verifications = verify_repairs(
+            results, outcomes, probe=probe, dry_run=args.dry_run,
+            rel_tol=rel_tol,
+        )
+    vcounts = (summarize_verify(verifications)
+               if verifications is not None else None)
     if args.json:
         payload = {
             "log": str(args.log),
@@ -274,6 +372,8 @@ def main(
             "dry_run": args.dry_run,
             "outcomes": outcomes,
             "counts": counts,
+            "verification": ({"results": verifications, "counts": vcounts}
+                             if verifications is not None else None),
         }
         json.dump(payload, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
@@ -292,12 +392,21 @@ def main(
         if undated_excluded:
             notes.append(
                 f"excluded {undated_excluded} session(s) with no usable date")
+        if vcounts is not None:
+            notes.append(
+                f"verify: {vcounts['verified']} verified, "
+                f"{vcounts['drifted']} drifted, "
+                f"{vcounts['unprobable']} unprobable, "
+                f"{vcounts['skipped']} skipped")
         sys.stderr.write("\n".join(notes) + "\n")
     else:
         sys.stdout.write(format_text(outcomes, args.log, skipped,
                                      date_from, date_to,
-                                     out_of_range, undated_excluded))
-    return 1 if counts["failed"] or counts["skipped_or_refused"] else 0
+                                     out_of_range, undated_excluded,
+                                     verifications=verifications))
+    drifted = vcounts["drifted"] if vcounts is not None else 0
+    return 1 if (counts["failed"] or counts["skipped_or_refused"]
+                 or drifted) else 0
 
 
 if __name__ == "__main__":

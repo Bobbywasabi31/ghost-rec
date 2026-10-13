@@ -159,11 +159,21 @@ python retime_all.py --log path\to\sessions.jsonl
 python retime_all.py --video-dir path\to\clips
 python retime_all.py --dry-run        # report only, run no ffmpeg
 python retime_all.py --force          # overwrite existing .retimed.mp4s
+python retime_all.py --verify         # re-probe each repaired output and confirm it plays at real time
 python retime_all.py --json           # machine-readable report
 python retime_all.py --csv            # per-clip results as CSV (notes go to stderr so stdout stays pure)
 python retime_all.py --from 2026-10-01 --to 2026-10-10  # only repair clips recorded in that date range (session start day, inclusive)
 python retime_all.py --days 7       # last 7 days including today
 ```
+
+`--verify` closes the loop after a batch repair: each repaired output
+is re-probed and checked against its logged wall-clock duration (same
+10%/2s tolerance) — "verified" means it now plays at real time,
+"drifted" means the repair didn't land (exit code 1), "unprobable"
+means the output couldn't be probed, and "skipped" covers the
+nothing-to-verify cases (failed repair, `--dry-run`, or no output file
+was written). Verification appears in the text report and `--json`
+payload; with `--csv` the summary goes to stderr so stdout stays pure.
 
 Exit code is 0 when there was nothing to repair or every repair
 succeeded, 1 when at least one repair failed or was refused (details in

@@ -667,6 +667,227 @@ def test_main_days_json_reports_resolved_bounds(tmp_path):
     assert payload["date_to"] == date.today().isoformat()
 
 
+# --- --verify: re-probe repaired outputs ----------------------------------
+
+def _verified_probe():
+    # input clip plays back 6s; the repaired output plays the full 60s
+    return canned_probe({"clip.mp4": 6.0, "clip.retimed.mp4": 60.0})
+
+
+def _repaired_outcome(tmp_path, code=0):
+    return {"file": "clip.mp4", "output": str(tmp_path / "clip.retimed.mp4"),
+            "code": code, "message": "repaired"}
+
+
+def test_verify_repairs_confirms_real_time(tmp_path):
+    clip, retimed = tmp_path / "clip.mp4", tmp_path / "clip.retimed.mp4"
+    touch(clip)
+    touch(retimed)  # stands in for the file the canned ffmpeg run wrote
+    verifications = retime_all.verify_repairs(
+        [_sped_up_result()], [_repaired_outcome(tmp_path)],
+        probe=_verified_probe())
+    (verification,) = verifications
+    assert verification["status"] == "verified"
+    assert verification["video_s"] == 60.0
+    assert verification["file"] == "clip.mp4"
+    assert "real time" in verification["note"]
+
+
+def test_verify_repairs_flags_drifted(tmp_path):
+    touch(tmp_path / "clip.mp4")
+    touch(tmp_path / "clip.retimed.mp4")
+    probe = canned_probe({"clip.mp4": 6.0, "clip.retimed.mp4": 30.0})
+    (verification,) = retime_all.verify_repairs(
+        [_sped_up_result()], [_repaired_outcome(tmp_path)], probe=probe)
+    assert verification["status"] == "drifted"
+    assert verification["video_s"] == 30.0
+    assert "still drifted" in verification["note"]
+
+
+def test_verify_repairs_unprobable_output(tmp_path):
+    touch(tmp_path / "clip.mp4")
+    touch(tmp_path / "clip.retimed.mp4")
+    probe = canned_probe({"clip.mp4": 6.0})  # no duration for the output
+    (verification,) = retime_all.verify_repairs(
+        [_sped_up_result()], [_repaired_outcome(tmp_path)], probe=probe)
+    assert verification["status"] == "unprobable"
+    assert verification["video_s"] is None
+    assert "could not probe" in verification["note"]
+
+
+def test_verify_repairs_skips_failed_repair(tmp_path):
+    (verification,) = retime_all.verify_repairs(
+        [_sped_up_result()], [_repaired_outcome(tmp_path, code=1)],
+        probe=_verified_probe())
+    assert verification["status"] == "skipped"
+    assert "repair did not succeed" in verification["note"]
+
+
+def test_verify_repairs_skips_dry_run(tmp_path):
+    (verification,) = retime_all.verify_repairs(
+        [_sped_up_result()], [_repaired_outcome(tmp_path)],
+        probe=_verified_probe(), dry_run=True)
+    assert verification["status"] == "skipped"
+    assert "dry-run" in verification["note"]
+
+
+def test_verify_repairs_skips_when_nothing_was_written(tmp_path):
+    # code 0 from the already-real-time no-op path writes no output file
+    touch(tmp_path / "clip.mp4")  # no clip.retimed.mp4 on disk
+    (verification,) = retime_all.verify_repairs(
+        [_sped_up_result()], [_repaired_outcome(tmp_path)],
+        probe=_verified_probe())
+    assert verification["status"] == "skipped"
+    assert "no output file was written" in verification["note"]
+
+
+def test_summarize_verify_buckets_by_status():
+    verifications = [
+        {"status": "verified"}, {"status": "verified"},
+        {"status": "drifted"}, {"status": "unprobable"},
+        {"status": "skipped"},
+    ]
+    assert retime_all.summarize_verify(verifications) == {
+        "verified": 2, "drifted": 1, "unprobable": 1, "skipped": 1}
+
+
+def test_format_text_verify_section_lists_problems_only(tmp_path):
+    verifications = [
+        {"file": "a.mp4", "output": "a.retimed.mp4", "status": "verified",
+         "video_s": 60.0, "note": "real time"},
+        {"file": "b.mp4", "output": "b.retimed.mp4", "status": "drifted",
+         "video_s": 30.0, "note": "b.retimed.mp4 plays at 30.0s vs 60.0s"},
+    ]
+    text = retime_all.format_text(
+        [{"file": "a.mp4", "output": "a.retimed.mp4", "code": 0,
+          "message": "ok"},
+         {"file": "b.mp4", "output": "b.retimed.mp4", "code": 0,
+          "message": "ok"}],
+        tmp_path / "sessions.jsonl", 0, verifications=verifications)
+    assert "verify: 1 verified, 1 drifted, 0 unprobable, 0 skipped" in text
+    assert "[DRIFTED] b.mp4" in text
+    assert "[VERIFIED] a.mp4" not in text  # verified clips are summarized
+
+
+def _verify_log(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [entry("clip.mp4", 60.0)])
+    return log
+
+
+def make_run_touch(calls, fail_on=()):
+    """Canned ffmpeg run that also materializes the output file on success,
+    the way a real ffmpeg run would -- the plain canned run writes nothing,
+    which would leave verify_repairs with nothing to probe."""
+    base = make_run(calls, fail_on)
+
+    def run(cmd, **kwargs):
+        proc = base(cmd, **kwargs)
+        if proc.returncode == 0:
+            Path(cmd[-1]).touch()
+        return proc
+    return run
+
+
+def test_main_verify_exit_0_all_verified(tmp_path):
+    log = _verify_log(tmp_path)
+    calls = []
+    code, text = run_main(
+        ["--log", str(log), "--verify"], _verified_probe(), make_run_touch(calls))
+    assert code == 0
+    assert len(calls) == 1  # repair still ran
+    assert "1 repaired" in text
+    assert "verify: 1 verified, 0 drifted, 0 unprobable, 0 skipped" in text
+
+
+def test_main_verify_exit_1_when_repair_drifted(tmp_path):
+    log = _verify_log(tmp_path)
+    probe = canned_probe({"clip.mp4": 6.0, "clip.retimed.mp4": 30.0})
+    code, text = run_main(
+        ["--log", str(log), "--verify"], probe, make_run_touch([]))
+    assert code == 1
+    assert "[DRIFTED] clip.mp4" in text
+    assert "still drifted" in text
+
+
+def test_main_verify_dry_run_marks_everything_skipped(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [entry("clip.mp4", 60.0)])
+    calls = []
+    code, text = run_main(
+        ["--log", str(log), "--verify", "--dry-run"],
+        _verified_probe(), make_run(calls))
+    assert code == 0
+    assert calls == []
+    assert "verify: 0 verified, 0 drifted, 0 unprobable, 1 skipped" in text
+    assert "[SKIPPED] clip.mp4" in text
+
+
+def test_main_verify_nothing_to_repair_has_no_verify_section(tmp_path):
+    clip = tmp_path / "ok.mp4"
+    touch(clip)
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [entry("ok.mp4", 60.0)])
+    code, text = run_main(
+        ["--log", str(log), "--verify"], canned_probe({"ok.mp4": 59.0}),
+        make_run([]))
+    assert code == 0
+    assert "nothing to repair" in text
+    assert "verify:" not in text
+
+
+def test_main_verify_json_carries_verification(tmp_path):
+    log = _verify_log(tmp_path)
+    code, text = run_main(
+        ["--log", str(log), "--verify", "--json"],
+        _verified_probe(), make_run_touch([]))
+    assert code == 0
+    payload = json.loads(text)
+    assert payload["verification"]["counts"] == {
+        "verified": 1, "drifted": 0, "unprobable": 0, "skipped": 0}
+    (result,) = payload["verification"]["results"]
+    assert result["file"] == "clip.mp4"
+    assert result["status"] == "verified"
+    assert result["video_s"] == 60.0
+
+
+def test_main_no_verify_flag_has_null_verification_in_json(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [entry("clip.mp4", 60.0)])
+    code, text = run_main(
+        ["--log", str(log), "--json"],
+        canned_probe({"clip.mp4": 6.0}), make_run([]))
+    assert code == 0
+    assert json.loads(text)["verification"] is None
+
+
+def test_main_verify_csv_note_on_stderr(tmp_path):
+    log = _verify_log(tmp_path)
+    code, text, err = run_main_streams(
+        ["--log", str(log), "--verify", "--csv"],
+        _verified_probe(), make_run_touch([]))
+    assert code == 0
+    rows = list(csv.reader(io.StringIO(text)))
+    assert rows[0] == ["file", "output", "code", "message"]
+    assert rows[1][2] == "0"  # repair row unchanged by verification
+    assert "verify: 1 verified, 0 drifted" in err
+
+
+def test_main_verify_still_fails_on_repair_failure(tmp_path):
+    log = _verify_log(tmp_path)
+    code, text = run_main(
+        ["--log", str(log), "--verify"], _verified_probe(),
+        make_run_touch([], fail_on=("clip.mp4",)))
+    assert code == 1  # failed repair dominates; its verify entry is skipped
+    assert "verify: 0 verified, 0 drifted, 0 unprobable, 1 skipped" in text
+
+
 @pytest.mark.parametrize("bad", ["abc", "0", "-5"])
 def test_main_bad_days_exits_2(bad):
     with pytest.raises(SystemExit) as exc_info:
