@@ -11,6 +11,7 @@ harmless in both cases.
 """
 
 import io
+import csv
 import json
 import subprocess
 from contextlib import redirect_stdout
@@ -398,6 +399,119 @@ def test_json_stdout_is_pure_json(tmp_path, capsys):
     out, err = capsys.readouterr()
     json.loads(out)  # raises if anything non-JSON reached stdout
     assert err == ""
+
+
+# --- --csv -----------------------------------------------------------------
+
+def _run_csv(tmp_path, argv, **main_kwargs):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = retime_clip.main(argv, **main_kwargs)
+    rows = list(csv.reader(io.StringIO(buf.getvalue())))
+    return code, rows
+
+
+def test_csv_success_carries_fields(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    out = tmp_path / "fixed.mp4"
+    calls = []
+    code, rows = _run_csv(
+        tmp_path,
+        [str(clip), "--duration", "600", "--output", str(out), "--csv"],
+        probe=canned_probe(6.0), run=make_run(calls),
+    )
+    assert code == 0
+    assert rows[0] == ["clip", "output", "exit_code", "target_s", "encoded_s",
+                       "stretch_factor", "dry_run", "message"]
+    header, row = rows
+    assert row[:7] == [str(clip), str(out), "0", "600.0", "6.0", "100.000",
+                       "false"]
+    assert row[7]  # the human-readable success message rides along
+    assert len(calls) == 1
+
+
+def test_csv_dry_run_marks_dry_run_and_factor(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    code, rows = _run_csv(
+        tmp_path,
+        [str(clip), "--duration", "240", "--csv", "--dry-run"],
+        probe=canned_probe(6.0),
+    )
+    assert code == 0
+    row = rows[1]
+    assert row[5] == "40.000"
+    assert row[6] == "true"
+    assert "setpts=40.000000*PTS" in row[7]
+
+
+def test_csv_already_realtime_has_empty_factor(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    code, rows = _run_csv(
+        tmp_path,
+        [str(clip), "--duration", "60", "--csv"],
+        probe=canned_probe(58.0),
+    )
+    assert code == 0
+    row = rows[1]
+    assert row[2] == "0"
+    assert row[4] == "58.0"
+    assert row[5] == ""  # no stretch applied
+    assert "nothing to do" in row[7]
+
+
+def test_csv_failure_payload_is_still_parseable(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    code, rows = _run_csv(
+        tmp_path,
+        [str(clip), "--duration", "60", "--csv"],
+        probe=canned_probe(None),
+    )
+    assert code == 1
+    row = rows[1]
+    assert row[2] == "1"
+    assert row[4] == "" and row[5] == ""
+    assert row[7]
+
+
+def test_csv_json_conflict_exits_2(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    with pytest.raises(SystemExit) as exc:
+        retime_clip.main([str(clip), "--duration", "60", "--json", "--csv"],
+                         probe=canned_probe(6.0))
+    assert exc.value.code == 2
+
+
+def test_csv_stdout_is_pure_csv(tmp_path, capsys):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    code = retime_clip.main(
+        [str(clip), "--duration", "60", "--csv"], probe=canned_probe(58.0)
+    )
+    assert code == 0
+    out, err = capsys.readouterr()
+    rows = list(csv.reader(io.StringIO(out)))
+    assert len(rows) == 2  # header + exactly one data row
+    assert err == ""
+
+
+def test_format_csv_quotes_commas_in_message():
+    payload = {
+        "clip": "a.mp4",
+        "output": "a.retimed.mp4",
+        "target_s": 60.0,
+        "dry_run": False,
+        "exit_code": 1,
+        "encoded_s": None,
+        "stretch_factor": None,
+        "message": 'hello, "world"',
+    }
+    rows = list(csv.reader(io.StringIO(retime_clip.format_csv(payload))))
+    assert rows[1][7] == 'hello, "world"'
 
 
 # --- end to end (real bundled ffmpeg) --------------------------------------

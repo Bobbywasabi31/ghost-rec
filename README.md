@@ -136,7 +136,9 @@ python retime_clip.py clip.mp4 --output fixed.mp4
 python retime_clip.py clip.mp4 --dry-run      # print the ffmpeg command
 python retime_clip.py clip.mp4 --force        # overwrite output / allow extreme stretch
 python retime_clip.py clip.mp4 --json         # machine-readable result on stdout (pure JSON)
+python retime_clip.py clip.mp4 --csv          # same fields as CSV (pure CSV)
 ```
+`--json` and `--csv` cannot be combined.
 
 Safety rails: refuses to write over the input or an existing output
 without `--force`; does nothing when the clip already plays at real time

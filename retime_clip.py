@@ -37,6 +37,8 @@ Exit codes: 0 = repaired (or already real time, nothing to do),
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import os
 import subprocess
@@ -211,6 +213,35 @@ def retime(input_path: Path, target_s: float, output_path: Path,
     )
 
 
+def format_csv(payload: dict) -> str:
+    """Render the single-clip result as a spreadsheet-friendly CSV.
+
+    One header row (clip,output,exit_code,target_s,encoded_s,
+    stretch_factor,dry_run,message), then one data row. Durations are
+    one-decimal seconds, stretch_factor 3 decimals (empty when None, e.g.
+    already-real-time no-ops and probe failures); plain decimals so
+    spreadsheets and pandas parse cleanly; stdlib csv handles quoting, so
+    commas in messages round-trip.
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["clip", "output", "exit_code", "target_s", "encoded_s",
+                     "stretch_factor", "dry_run", "message"])
+    encoded = payload["encoded_s"]
+    factor = payload["stretch_factor"]
+    writer.writerow([
+        payload["clip"],
+        payload["output"] or "",
+        payload["exit_code"],
+        f"{payload['target_s']:.1f}",
+        f"{encoded:.1f}" if encoded is not None else "",
+        f"{factor:.3f}" if factor is not None else "",
+        "true" if payload["dry_run"] else "false",
+        payload["message"],
+    ])
+    return buf.getvalue()
+
+
 def main(argv: list[str] | None = None,
          probe=probe_video_duration,
          run=_ffmpeg_run) -> int:
@@ -235,7 +266,13 @@ def main(argv: list[str] | None = None,
     parser.add_argument("--json", action="store_true",
                         help="machine-readable JSON result on stdout "
                         "(stdout stays pure JSON)")
+    parser.add_argument("--csv", action="store_true",
+                        help="machine-readable CSV result on stdout "
+                        "(stdout stays pure CSV)")
     args = parser.parse_args(argv)
+
+    if args.json and args.csv:
+        parser.error("--json and --csv cannot be combined")
 
     if not args.clip.is_file():
         parser.error(f"clip not found: {args.clip}")
@@ -256,7 +293,7 @@ def main(argv: list[str] | None = None,
     code, message = retime(args.clip, target_s, output_path,
                            force=args.force, dry_run=args.dry_run,
                            probe=probe, run=run, details=details)
-    if args.json:
+    if args.json or args.csv:
         payload = {
             "clip": str(args.clip),
             "output": details["output"],
@@ -267,8 +304,11 @@ def main(argv: list[str] | None = None,
             "stretch_factor": details["stretch_factor"],
             "message": message,
         }
-        json.dump(payload, sys.stdout, indent=2, sort_keys=True)
-        sys.stdout.write("\n")
+        if args.json:
+            json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+        else:
+            sys.stdout.write(format_csv(payload))
     elif code == 0:
         print(message)
     else:
