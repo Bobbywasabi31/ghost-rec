@@ -258,6 +258,61 @@ def test_summarize_buckets_by_code():
         "repaired": 2, "failed": 1, "skipped_or_refused": 1}
 
 
+def test_repair_all_outcome_carries_repair_details(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    outcomes = retime_all.repair_all(
+        [_sped_up_result(duration=60.0)], tmp_path,
+        probe=canned_probe({"clip.mp4": 6.0}), run=make_run([]))
+    (outcome,) = outcomes
+    assert outcome["target_s"] == 60.0
+    assert outcome["encoded_s"] == 6.0
+    assert outcome["stretch_factor"] == 10.0
+    assert outcome["dry_run"] is False
+
+
+def test_repair_all_dry_run_outcome_still_carries_factor(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    outcomes = retime_all.repair_all(
+        [_sped_up_result(duration=60.0)], tmp_path, dry_run=True,
+        probe=canned_probe({"clip.mp4": 6.0}), run=make_run([]))
+    (outcome,) = outcomes
+    assert outcome["code"] == 0
+    assert outcome["target_s"] == 60.0
+    assert outcome["encoded_s"] == 6.0
+    assert outcome["stretch_factor"] == 10.0
+    assert outcome["dry_run"] is True
+
+
+def test_repair_all_unprobable_outcome_has_empty_details(tmp_path):
+    # probe returns None -> retime refuses before measuring a factor
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    outcomes = retime_all.repair_all(
+        [_sped_up_result(duration=60.0)], tmp_path,
+        probe=canned_probe({}), run=make_run([]))
+    (outcome,) = outcomes
+    assert outcome["code"] == 1
+    assert outcome["target_s"] == 60.0
+    assert outcome["encoded_s"] is None
+    assert outcome["stretch_factor"] is None
+
+
+def test_repair_all_noop_outcome_has_no_factor(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    result = {"file": "clip.mp4", "duration_s": 60.0, "video_s": 55.0,
+              "status": "SPED_UP", "note": ""}
+    outcomes = retime_all.repair_all(
+        [result], tmp_path,
+        probe=canned_probe({"clip.mp4": 55.0}), run=make_run([]))
+    (outcome,) = outcomes
+    assert outcome["code"] == 0
+    assert outcome["encoded_s"] == 55.0
+    assert outcome["stretch_factor"] is None  # nothing stretched
+
+
 def test_format_text_nothing_to_repair(tmp_path):
     text = retime_all.format_text([], tmp_path / "sessions.jsonl", 0)
     assert "nothing to repair" in text
@@ -499,30 +554,50 @@ def run_main_streams(argv, probe, run):
 
 def test_format_csv_header_and_rows():
     csv_text = retime_all.format_csv([
-        {"file": "a.mp4", "output": "a.retimed.mp4",
-         "code": 0, "message": "repaired"},
-        {"file": "b.mp4", "output": "b.retimed.mp4",
-         "code": 1, "message": "ffmpeg boom"},
+        {"file": "a.mp4", "output": "a.retimed.mp4", "code": 0,
+         "message": "repaired", "target_s": 60.0, "encoded_s": 6.0,
+         "stretch_factor": 10.0, "dry_run": False},
+        {"file": "b.mp4", "output": "b.retimed.mp4", "code": 1,
+         "message": "ffmpeg boom", "target_s": 60.0, "encoded_s": None,
+         "stretch_factor": None, "dry_run": False},
     ])
     rows = list(csv.reader(io.StringIO(csv_text)))
-    assert rows[0] == ["file", "output", "code", "message"]
-    assert rows[1] == ["a.mp4", "a.retimed.mp4", "0", "repaired"]
-    assert rows[2] == ["b.mp4", "b.retimed.mp4", "1", "ffmpeg boom"]
+    assert rows[0] == ["file", "output", "code", "target_s", "encoded_s",
+                       "stretch_factor", "dry_run", "message"]
+    assert rows[1] == ["a.mp4", "a.retimed.mp4", "0", "60.0", "6.0",
+                       "10.000", "false", "repaired"]
+    # probe failure: durations/factor columns stay empty, not "None"
+    assert rows[2] == ["b.mp4", "b.retimed.mp4", "1", "60.0", "", "",
+                       "false", "ffmpeg boom"]
+
+
+def test_format_csv_tolerates_minimal_outcome_dicts():
+    # pre-detail outcomes (hand-built or old pickles) still render --
+    # detail columns come out empty rather than KeyError-ing.
+    csv_text = retime_all.format_csv([
+        {"file": "a.mp4", "output": "a.retimed.mp4",
+         "code": 0, "message": "repaired"},
+    ])
+    rows = list(csv.reader(io.StringIO(csv_text)))
+    assert rows[1] == ["a.mp4", "a.retimed.mp4", "0", "", "", "",
+                       "false", "repaired"]
 
 
 def test_format_csv_comma_in_filename_roundtrips():
     csv_text = retime_all.format_csv([
         {"file": "clip, one.mp4", "output": "clip, one.retimed.mp4",
-         "code": 0, "message": "ok, repaired"},
+         "code": 0, "message": "ok, repaired", "target_s": 60.0,
+         "encoded_s": 6.0, "stretch_factor": 10.0, "dry_run": False},
     ])
     rows = list(csv.reader(io.StringIO(csv_text)))
-    assert rows[1] == ["clip, one.mp4", "clip, one.retimed.mp4",
-                       "0", "ok, repaired"]
+    assert rows[1] == ["clip, one.mp4", "clip, one.retimed.mp4", "0",
+                       "60.0", "6.0", "10.000", "false", "ok, repaired"]
 
 
 def test_format_csv_empty_outcomes_is_header_only():
     rows = list(csv.reader(io.StringIO(retime_all.format_csv([]))))
-    assert rows == [["file", "output", "code", "message"]]
+    assert rows == [["file", "output", "code", "target_s", "encoded_s",
+                     "stretch_factor", "dry_run", "message"]]
 
 
 def test_main_csv_stdout_is_pure_csv_and_notes_on_stderr(tmp_path):
@@ -535,10 +610,15 @@ def test_main_csv_stdout_is_pure_csv_and_notes_on_stderr(tmp_path):
         canned_probe({"clip.mp4": 6.0}), make_run([]))
     assert code == 0
     rows = list(csv.reader(io.StringIO(text)))
-    assert rows[0] == ["file", "output", "code", "message"]
+    assert rows[0] == ["file", "output", "code", "target_s", "encoded_s",
+                       "stretch_factor", "dry_run", "message"]
     assert rows[1][0] == "clip.mp4"
     assert rows[1][2] == "0"
     assert rows[1][1].endswith("clip.retimed.mp4")
+    assert rows[1][3] == "60.0"    # logged duration
+    assert rows[1][4] == "6.0"     # probed playback length
+    assert rows[1][5] == "10.000"  # applied stretch factor
+    assert rows[1][6] == "false"
     assert f"log: {log}" in err
 
 
@@ -550,7 +630,8 @@ def test_main_csv_empty_outcomes_header_only(tmp_path):
         canned_probe({"clip.mp4": 60.0}), make_run([]))
     assert code == 0
     assert list(csv.reader(io.StringIO(text))) == [
-        ["file", "output", "code", "message"]]
+        ["file", "output", "code", "target_s", "encoded_s",
+         "stretch_factor", "dry_run", "message"]]
     assert f"log: {log}" in err
 
 
@@ -565,7 +646,8 @@ def test_main_csv_failed_repair_row_and_exit_1(tmp_path):
     assert code == 1
     rows = list(csv.reader(io.StringIO(text)))
     assert rows[1][2] == "1"
-    assert "mock ffmpeg boom" in rows[1][3]
+    assert "mock ffmpeg boom" in rows[1][7]
+    assert rows[1][5] == ""  # no stretch factor on a failed ffmpeg run
 
 
 def test_main_csv_skipped_line_note_on_stderr(tmp_path):
@@ -874,7 +956,8 @@ def test_main_verify_csv_note_on_stderr(tmp_path):
         _verified_probe(), make_run_touch([]))
     assert code == 0
     rows = list(csv.reader(io.StringIO(text)))
-    assert rows[0] == ["file", "output", "code", "message"]
+    assert rows[0] == ["file", "output", "code", "target_s", "encoded_s",
+                       "stretch_factor", "dry_run", "message"]
     assert rows[1][2] == "0"  # repair row unchanged by verification
     assert "verify: 1 verified, 0 drifted" in err
 

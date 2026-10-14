@@ -190,6 +190,13 @@ nothing-to-verify cases (failed repair, `--dry-run`, or no output file
 was written). Verification appears in the text report and `--json`
 payload; with `--csv` the summary goes to stderr so stdout stays pure.
 
+`--csv` prints one row per clip: `file,output,code,target_s,encoded_s,
+stretch_factor,dry_run,message` — the same column set as
+`retime_clip.py --csv`, so single-clip and batch reports join cleanly
+(`stretch_factor`/`encoded_s` stay empty for probe failures and
+already-real-time no-ops). The `--json` payload's per-clip `outcomes`
+carry the same fields.
+
 Exit code is 0 when there was nothing to repair or every repair
 succeeded, 1 when at least one repair failed or was refused (details in
 the report), 2 on a usage error. `--days N` (N ≥ 1) is shorthand for the

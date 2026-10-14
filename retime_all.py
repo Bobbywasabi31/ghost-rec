@@ -102,8 +102,11 @@ def repair_all(
 ) -> list[dict]:
     """Repair every SPED_UP result; return one outcome dict per clip.
 
-    Outcome: {"file", "output", "code", "message"}. Per-clip failures never
-    stop the batch -- a failing clip is recorded and the next one runs.
+    Outcome: {"file", "output", "code", "message", "target_s",
+    "encoded_s", "stretch_factor", "dry_run"} -- the last four mirror
+    retime_clip.py's single-clip --csv columns, so the batch CSV has
+    full sibling parity with it. Per-clip failures never stop the batch
+    -- a failing clip is recorded and the next one runs.
     rel_tol/abs_floor are the selection tolerance: they flow into
     retime_clip's already-real-time gate so a clip flagged SPED_UP at a
     stricter tolerance is actually repaired, not no-op'd.
@@ -112,11 +115,12 @@ def repair_all(
     for result in results:
         input_path = video_dir / result["file"]
         output_path = resolve_output(input_path, None)
+        details: dict = {}
         try:
             code, message = retime(
                 input_path, result["duration_s"], output_path,
                 force=force, dry_run=dry_run, probe=probe, run=run,
-                rel_tol=rel_tol, abs_floor=abs_floor,
+                rel_tol=rel_tol, abs_floor=abs_floor, details=details,
             )
         except Exception as exc:  # noqa: BLE001 - batch must continue
             code, message = 1, f"unexpected error: {exc}"
@@ -125,6 +129,10 @@ def repair_all(
             "output": str(output_path),
             "code": code,
             "message": message,
+            "target_s": result["duration_s"],
+            "encoded_s": details.get("encoded_s"),
+            "stretch_factor": details.get("stretch_factor"),
+            "dry_run": dry_run,
         })
     return outcomes
 
@@ -254,18 +262,30 @@ def format_text(outcomes: list[dict], log_path: Path, skipped: int,
 def format_csv(outcomes: list[dict]) -> str:
     """Render the per-clip repair outcomes as a spreadsheet-friendly CSV.
 
-    One header row (file,output,code,message), then one row per clip.
-    Plain decimals and strings so spreadsheets and pandas parse cleanly;
+    One header row (file,output,code,target_s,encoded_s,stretch_factor,
+    dry_run,message), then one row per clip -- the same column set as
+    retime_clip.py's --csv, so single-clip and batch reports join
+    cleanly. Durations are one-decimal seconds, stretch_factor 3 decimals
+    (empty when None, e.g. probe failures and already-real-time no-ops);
+    plain decimals and strings so spreadsheets and pandas parse cleanly;
     stdlib csv handles quoting, so commas in filenames round-trip.
     """
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["file", "output", "code", "message"])
+    writer.writerow(["file", "output", "code", "target_s", "encoded_s",
+                     "stretch_factor", "dry_run", "message"])
     for outcome in outcomes:
+        target = outcome.get("target_s")
+        encoded = outcome.get("encoded_s")
+        factor = outcome.get("stretch_factor")
         writer.writerow([
             outcome["file"] or "",
             outcome["output"] or "",
             outcome["code"],
+            f"{target:.1f}" if target is not None else "",
+            f"{encoded:.1f}" if encoded is not None else "",
+            f"{factor:.3f}" if factor is not None else "",
+            "true" if outcome.get("dry_run") else "false",
             outcome["message"] or "",
         ])
     return buf.getvalue()
