@@ -538,3 +538,158 @@ def test_main_bad_days_exits_2(tmp_path, capsys, bad):
         check_playback.main(["--days", bad])
     assert excinfo.value.code == 2
     assert "positive integer" in capsys.readouterr().err
+
+
+# --- orphan scan: MP4s on disk with no log entry ----------------------------
+
+import os
+
+
+def test_find_orphans_flags_unlogged_mp4(tmp_path):
+    touch(tmp_path / "logged.mp4")
+    touch(tmp_path / "orphan.mp4")
+    orphans, out_of_range, undated = check_playback.find_orphans(
+        tmp_path, {"logged.mp4"}, probe=canned_probe(12.5))
+    assert [o["file"] for o in orphans] == ["orphan.mp4"]
+    assert orphans[0]["video_s"] == 12.5
+    assert (out_of_range, undated) == (0, 0)
+
+
+def test_find_orphans_case_insensitive_match(tmp_path):
+    # The recorder runs on case-insensitive Windows: "Clip.MP4" in the log
+    # matches clip.mp4 on disk.
+    touch(tmp_path / "clip.mp4")
+    orphans, _, _ = check_playback.find_orphans(tmp_path, {"Clip.MP4"})
+    assert orphans == []
+
+
+def test_find_orphans_excludes_retimed_outputs(tmp_path):
+    # <name>.retimed.mp4 is a repair artifact derived from a logged clip,
+    # not an orphaned recording.
+    touch(tmp_path / "clip.mp4")
+    touch(tmp_path / "clip.retimed.mp4")
+    orphans, _, _ = check_playback.find_orphans(tmp_path, {"clip.mp4"})
+    assert orphans == []
+
+
+def test_find_orphans_ignores_non_mp4(tmp_path):
+    touch(tmp_path / "notes.txt")
+    (tmp_path / "sessions.jsonl").write_text("")
+    orphans, _, _ = check_playback.find_orphans(tmp_path, set())
+    assert orphans == []
+
+
+def test_find_orphans_missing_dir_is_empty(tmp_path):
+    orphans, out_of_range, undated = check_playback.find_orphans(
+        tmp_path / "nope", set())
+    assert orphans == [] and (out_of_range, undated) == (0, 0)
+
+
+def _set_mtime_days_ago(path: Path, days: int):
+    from datetime import datetime
+    ts = (datetime.now() - timedelta(days=days)).timestamp()
+    os.utime(path, (ts, ts))
+
+
+def test_find_orphans_date_range_uses_mtime(tmp_path):
+    touch(tmp_path / "old.mp4")
+    touch(tmp_path / "new.mp4")
+    _set_mtime_days_ago(tmp_path / "old.mp4", 30)
+    day_from = date.today() - timedelta(days=7)
+    orphans, out_of_range, undated = check_playback.find_orphans(
+        tmp_path, set(), date_from=day_from)
+    assert [o["file"] for o in orphans] == ["new.mp4"]
+    assert out_of_range == 1
+    assert undated == 0
+    # no bounds: both reported
+    orphans, _, _ = check_playback.find_orphans(tmp_path, set())
+    assert sorted(o["file"] for o in orphans) == ["new.mp4", "old.mp4"]
+
+
+def test_main_orphans_warn_but_never_fail(tmp_path):
+    # Orphan-only run: warning in the text report, exit still 0.
+    # Real clips so the bundled-ffmpeg probe works end to end.
+    write_clip(tmp_path / "logged.mp4", frames=60, fps=60)     # 1.0 s
+    write_clip(tmp_path / "orphan.mp4", frames=600, fps=30)    # 20.0 s
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [entry(file="logged.mp4", duration=1.0)])
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = check_playback.main(
+            ["--log", str(log), "--video-dir", str(tmp_path)])
+    out = buf.getvalue()
+    assert code == 0
+    assert "[  ORPHANED] orphan.mp4" in out
+    assert "video=20.0s logged=?" in out
+    assert "1 orphaned file(s) on disk" in out
+    assert "logged.mp4" in out and "[        OK]" in out
+
+
+def test_main_logged_out_of_range_not_orphan(tmp_path):
+    # A clip logged outside the checked range still has a log entry.
+    write_clip(tmp_path / "oldclip.mp4", frames=60, fps=60)    # 1.0 s
+    log = tmp_path / "sessions.jsonl"
+    old = (date.today() - timedelta(days=30)).isoformat()
+    write_log(log, [dict(entry(file="oldclip.mp4", duration=1.0),
+                         start=f"{old}T12:00:00")])
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = check_playback.main(
+            ["--log", str(log), "--video-dir", str(tmp_path),
+             "--from", date.today().isoformat()])
+    out = buf.getvalue()
+    assert code == 0
+    assert "ORPHANED" not in out
+    assert "excluded 1 session(s) outside the range" in out
+
+
+def test_main_json_carries_orphans(tmp_path):
+    write_clip(tmp_path / "logged.mp4", frames=60, fps=60)     # 1.0 s
+    write_clip(tmp_path / "orphan.mp4", frames=600, fps=30)    # 20.0 s
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [entry(file="logged.mp4", duration=1.0)])
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = check_playback.main(
+            ["--log", str(log), "--video-dir", str(tmp_path), "--json"])
+    assert code == 0
+    payload = json.loads(buf.getvalue())
+    assert payload["orphaned"] == 1
+    assert len(payload["orphans"]) == 1
+    assert payload["orphans"][0]["file"] == "orphan.mp4"
+    assert payload["orphans"][0]["video_s"] == pytest.approx(20.0, abs=0.5)
+    assert payload["orphan_out_of_range"] == 0
+    assert payload["orphan_undated"] == 0
+
+
+def test_main_csv_orphan_rows(tmp_path):
+    write_clip(tmp_path / "logged.mp4", frames=60, fps=60)     # 1.0 s
+    write_clip(tmp_path / "orphan.mp4", frames=600, fps=30)    # 20.0 s
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [entry(file="logged.mp4", duration=1.0)])
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = check_playback.main(
+            ["--log", str(log), "--video-dir", str(tmp_path), "--csv"])
+    assert code == 0
+    rows = list(csv.reader(io.StringIO(buf.getvalue())))
+    assert rows[0] == ["file", "status", "video_s", "duration_s", "drift_ratio"]
+    orphan_rows = [r for r in rows[1:] if r[1] == "ORPHANED"]
+    assert len(orphan_rows) == 1
+    assert orphan_rows[0][0] == "orphan.mp4"
+    assert orphan_rows[0][3:] == ["", ""]           # no logged span
+    assert float(orphan_rows[0][2]) == pytest.approx(20.0, abs=0.5)
+
+
+def test_check_log_contract_unchanged(tmp_path):
+    # retime_all.py unpacks a 4-tuple from check_log; the orphan scan must
+    # not change that contract.
+    touch(tmp_path / "clip.mp4")
+    log = tmp_path / "sessions.jsonl"
+    write_log(log, [entry(file="clip.mp4", duration=60.0)])
+    with mock.patch.object(check_playback, "probe_video_duration",
+                           return_value=60.0):
+        results, skipped, out_of_range, undated = check_playback.check_log(
+            log, tmp_path)
+    assert len(results) == 1
+    assert (skipped, out_of_range, undated) == (0, 0, 0)

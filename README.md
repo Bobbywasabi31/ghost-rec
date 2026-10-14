@@ -119,6 +119,15 @@ and `--csv` cannot be combined. Exit code is 1 when any session
 drifted, 0 when everything is within tolerance (or nothing was checkable),
 2 on a usage error.
 
+The same run also flags MP4s in the video directory that no log entry
+names (`ORPHANED` — a crashed session, a recording made before the JSONL
+log existed, or a file copied in by hand). `*.retimed.mp4` repair outputs
+are excluded since they're derived from logged clips. Orphans get a probed
+`video_s` but no drift verdict — there is no logged span to compare
+against — so they appear as warnings in the text/`--json`/`--csv` reports
+and never flip the exit code. Under a date range, orphans are filtered by
+file modification day (an orphan has no session start).
+
 `retime_clip.py` (issue #1 follow-up) *repairs* a clip that
 `check_playback.py` flagged: it re-times the video stream back to the
 wall-clock capture span so the clip plays at real-time speed again. The

@@ -33,6 +33,14 @@ checkable), 1 = at least one session drifted beyond tolerance, 2 = usage
 error. Bad log lines are skipped and counted, never fatal -- same stance as
 sessions_summary.py.
 
+The tool also flags MP4s in the video dir that no log entry names
+(status ORPHANED -- a crashed session, a pre-logging recording, or a file
+copied in by hand; `*.retimed.mp4` repair outputs are repair artifacts and
+are excluded). Orphans are warnings only: they never flip the exit code to
+1, since there is no logged span to compare them against. Under a date
+range, orphans are filtered by file modification day instead of session
+start day.
+
 Notes (log path, skipped lines, active filters) go to stderr under --csv so
 stdout stays pure CSV; --json and --csv cannot be combined.
 """
@@ -46,6 +54,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from sessions_summary import (
@@ -180,6 +189,28 @@ def check_entry(
     return result
 
 
+def _check_entries(
+    entries: list[dict],
+    skipped: int,
+    video_dir: Path,
+    probe=probe_video_duration,
+    rel_tol: float = 0.10,
+    abs_floor: float = 2.0,
+    date_from=None,
+    date_to=None,
+) -> tuple[list[dict], int, int, int]:
+    """Check already-loaded entries; return (results, skipped, out_of_range,
+    undated_excluded)."""
+    entries, out_of_range, undated_excluded = filter_entries_by_date(
+        entries, date_from, date_to
+    )
+    results = [
+        check_entry(entry, video_dir, probe, rel_tol, abs_floor)
+        for entry in entries
+    ]
+    return results, skipped, out_of_range, undated_excluded
+
+
 def check_log(
     log_path: Path,
     video_dir: Path,
@@ -197,20 +228,67 @@ def check_log(
     count as out_of_range, and undated entries count as undated_excluded.
     """
     entries, skipped = load_entries(log_path)
-    entries, out_of_range, undated_excluded = filter_entries_by_date(
-        entries, date_from, date_to
-    )
-    results = [
-        check_entry(entry, video_dir, probe, rel_tol, abs_floor)
-        for entry in entries
-    ]
-    return results, skipped, out_of_range, undated_excluded
+    return _check_entries(entries, skipped, video_dir, probe,
+                          rel_tol, abs_floor, date_from, date_to)
+
+
+def find_orphans(
+    video_dir: Path,
+    known_names,
+    probe=probe_video_duration,
+    date_from=None,
+    date_to=None,
+) -> tuple[list[dict], int, int]:
+    """Find MP4s on disk that no log entry names.
+
+    Returns (orphans, out_of_range, undated): each orphan is
+    {"file": name, "video_s": probed playback seconds or None}. Files are
+    matched against known_names exactly and case-insensitively (the recorder
+    runs on case-insensitive Windows). `*.retimed.mp4` repair outputs are
+    repair artifacts derived from logged clips, not orphaned recordings,
+    so they are excluded. When date_from/date_to are set, orphans are
+    filtered by file modification day (an orphan has no session start);
+    files whose mtime can't be read are excluded and counted as undated.
+    """
+    known = {n for n in known_names if n}
+    known_lower = {n.lower() for n in known}
+    orphans: list[dict] = []
+    out_of_range = 0
+    undated = 0
+    try:
+        files = sorted(video_dir.iterdir())
+    except OSError:
+        return orphans, out_of_range, undated
+    for path in files:
+        if not path.is_file() or path.suffix.lower() != ".mp4":
+            continue
+        name = path.name
+        if name.lower().endswith(".retimed.mp4"):
+            continue
+        if name in known or name.lower() in known_lower:
+            continue
+        if date_from is not None or date_to is not None:
+            try:
+                day = datetime.fromtimestamp(path.stat().st_mtime).date()
+            except OSError:
+                undated += 1
+                continue
+            if (date_from and day < date_from) or (
+                    date_to and day > date_to):
+                out_of_range += 1
+                continue
+        orphans.append({"file": name, "video_s": probe(path)})
+    return orphans, out_of_range, undated
 
 
 def format_text(results: list[dict], log_path: Path, skipped: int,
                 date_from=None, date_to=None,
-                out_of_range: int = 0, undated_excluded: int = 0) -> str:
+                out_of_range: int = 0, undated_excluded: int = 0,
+                orphans: list[dict] | None = None,
+                orphan_out_of_range: int = 0,
+                orphan_undated: int = 0) -> str:
     """Render a human-readable report."""
+    orphans = orphans or []
     lines = [f"playback check: {log_path}"]
     if date_from is not None or date_to is not None:
         lo = date_from.isoformat() if date_from else "beginning"
@@ -233,24 +311,41 @@ def format_text(results: list[dict], log_path: Path, skipped: int,
         lines.append(f"  [{row['status']:>10}] {name}  video={video} logged={logged}")
         if row["status"] in ("SPED_UP", "STRETCHED"):
             lines.append(f"               {row['note']}")
+    for row in orphans:
+        video = "?" if row["video_s"] is None else f"{row['video_s']:.1f}s"
+        lines.append(f"  [  ORPHANED] {row['file']}  video={video} logged=?")
+        lines.append("               on disk with no log entry "
+                     "(crash, pre-logging build, or copied in by hand)")
+    if orphan_out_of_range:
+        lines.append(
+            f"  (excluded {orphan_out_of_range} unlogged file(s) "
+            "outside the range)")
+    if orphan_undated:
+        lines.append(
+            f"  (excluded {orphan_undated} unlogged file(s) "
+            "with unreadable mtime)")
     drifted = counts.get("SPED_UP", 0) + counts.get("STRETCHED", 0)
-    lines.append(
-        f"{len(results)} session(s) checked: {drifted} drifted, "
-        f"{counts.get('OK', 0)} ok"
-    )
+    summary = (f"{len(results)} session(s) checked: {drifted} drifted, "
+               f"{counts.get('OK', 0)} ok")
+    if orphans:
+        summary += f", {len(orphans)} orphaned file(s) on disk"
+    lines.append(summary)
     return "\n".join(lines) + "\n"
 
 
-def format_csv(results: list[dict]) -> str:
+def format_csv(results: list[dict], orphans: list[dict] | None = None) -> str:
     """Render the per-session results as a spreadsheet-friendly CSV.
 
     One header row (file,status,video_s,duration_s,drift_ratio), then one
-    row per checked session. Durations are one-decimal seconds; drift_ratio
+    row per checked session, then one ORPHANED row per unlogged MP4 found on
+    disk (duration_s and drift_ratio empty -- there is no logged span to
+    compare against). Durations are one-decimal seconds; drift_ratio
     is video_s / duration_s (3 decimals, empty when either side is
     unusable -- MISSING/UNREADABLE/NO_FILE/NO_DURATION). Plain decimals so
     spreadsheets and pandas parse cleanly; stdlib csv handles quoting, so
     commas in filenames round-trip.
     """
+    orphans = orphans or []
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["file", "status", "video_s", "duration_s", "drift_ratio"])
@@ -267,6 +362,15 @@ def format_csv(results: list[dict]) -> str:
             f"{video:.1f}" if video is not None else "",
             f"{expected:.1f}" if expected is not None else "",
             ratio,
+        ])
+    for row in orphans:
+        video = row["video_s"]
+        writer.writerow([
+            row["file"],
+            "ORPHANED",
+            f"{video:.1f}" if video is not None else "",
+            "",
+            "",
         ])
     return buf.getvalue()
 
@@ -325,10 +429,16 @@ def main(argv: list[str] | None = None) -> int:
         if date_from and date_to and date_from > date_to:
             parser.error(f"--from {date_from} is after --to {date_to}")
     video_dir = args.video_dir or args.log.parent
-    results, skipped, out_of_range, undated_excluded = check_log(
-        args.log, video_dir, rel_tol=args.tolerance / 100.0,
+    entries, skipped = load_entries(args.log)
+    results, _, out_of_range, undated_excluded = _check_entries(
+        entries, skipped, video_dir, rel_tol=args.tolerance / 100.0,
         date_from=date_from, date_to=date_to,
     )
+    # A clip with a log entry out of the checked range still has a log
+    # entry, so known names come from the unfiltered entries.
+    known_names = {e.get("file") for e in entries if e.get("file")}
+    orphans, orphan_out_of_range, orphan_undated = find_orphans(
+        video_dir, known_names, date_from=date_from, date_to=date_to)
     drifted = [r for r in results if r["status"] in ("SPED_UP", "STRETCHED")]
     if args.json:
         payload = {
@@ -342,11 +452,15 @@ def main(argv: list[str] | None = None) -> int:
             "undated_excluded": undated_excluded,
             "sessions": results,
             "drifted": len(drifted),
+            "orphans": orphans,
+            "orphaned": len(orphans),
+            "orphan_out_of_range": orphan_out_of_range,
+            "orphan_undated": orphan_undated,
         }
         json.dump(payload, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
     elif args.csv:
-        sys.stdout.write(format_csv(results))
+        sys.stdout.write(format_csv(results, orphans))
         notes = [f"log: {args.log}"]
         if date_from is not None or date_to is not None:
             lo = date_from.isoformat() if date_from else "beginning"
@@ -360,11 +474,23 @@ def main(argv: list[str] | None = None) -> int:
         if undated_excluded:
             notes.append(
                 f"excluded {undated_excluded} session(s) with no usable date)")
+        if orphan_out_of_range:
+            notes.append(
+                f"excluded {orphan_out_of_range} unlogged file(s) "
+                "outside the range")
+        if orphan_undated:
+            notes.append(
+                f"excluded {orphan_undated} unlogged file(s) "
+                "with unreadable mtime")
+        if orphans:
+            notes.append(f"{len(orphans)} orphaned file(s) on disk")
         sys.stderr.write("\n".join(notes) + "\n")
     else:
         sys.stdout.write(format_text(results, args.log, skipped,
                                      date_from, date_to,
-                                     out_of_range, undated_excluded))
+                                     out_of_range, undated_excluded,
+                                     orphans, orphan_out_of_range,
+                                     orphan_undated))
     return 1 if drifted else 0
 
 
