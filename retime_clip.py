@@ -19,18 +19,27 @@ restores A/V sync. The input file is never modified; a new file is written.
     python retime_clip.py clip.mp4 --dry-run      # print the ffmpeg command
     python retime_clip.py clip.mp4 --force        # overwrite output / allow extreme stretch
     python retime_clip.py clip.mp4 --json         # machine-readable result on stdout
+    python retime_clip.py clip.mp4 --verify       # re-probe the repaired output
+                                                  # and confirm it plays at real time
 
 The ffmpeg binary bundled with imageio-ffmpeg (already a ghost-rec
 dependency) does the re-encode; CREATE_NO_WINDOW is used on Windows so no
 console flashes.
 
 With --json the payload (clip, output, target_s, exit_code, encoded_s,
-stretch_factor, message) goes to stdout as pure JSON, mirroring the other
-ghost-rec report tools; without it, the human-readable message goes to
-stdout on success and stderr on failure.
+stretch_factor, message, verification) goes to stdout as pure JSON, mirroring
+the other ghost-rec report tools; without it, the human-readable message goes
+to stdout on success and stderr on failure.
+
+--verify closes the single-clip loop the way retime_all.py --verify does for
+batches: the repaired output is re-probed and checked against the target
+duration with the same tolerance. A clip that needed no repair is verified
+against the input itself (it just passed the real-time gate); --dry-run and
+failed repairs report "skipped".
 
 Exit codes: 0 = repaired (or already real time, nothing to do),
-1 = the clip couldn't be probed or ffmpeg failed,
+1 = the clip couldn't be probed, ffmpeg failed, or --verify found the
+output still drifted/unprobable,
 2 = usage error (bad duration, overwrite refused, insane stretch).
 """
 
@@ -120,6 +129,34 @@ def already_realtime(encoded_s: float, target_s: float,
     return abs(encoded_s - target_s) <= max(rel_tol * target_s, abs_floor)
 
 
+def verify_output(check_path: Path, target_s: float,
+                  probe=probe_video_duration,
+                  rel_tol: float = REL_TOL,
+                  abs_floor: float = ABS_FLOOR) -> tuple[str, float | None, str]:
+    """Re-probe a repaired clip; confirm it now plays at real time.
+
+    Single-clip mirror of retime_all.verify_repairs' per-clip semantics:
+    "verified" when the file probes within tolerance of target_s, "drifted"
+    when it probes outside it (the repair didn't land), "unprobable" when it
+    can't be probed, "skipped" when the file doesn't exist. Returns
+    (status, video_s, note). Callers pick which file to check -- the repaired
+    output after a real repair, the input itself after an already-real-time
+    no-op (nothing was written).
+    """
+    if not check_path.exists():
+        return "skipped", None, "no output file was written"
+    video_s = probe(check_path)
+    if video_s is None:
+        return "unprobable", None, f"could not probe {check_path.name}"
+    if already_realtime(video_s, target_s, rel_tol, abs_floor):
+        return ("verified", video_s,
+                f"{check_path.name} plays at {video_s:.1f}s vs "
+                f"{target_s:.1f}s target -- real time")
+    return ("drifted", video_s,
+            f"{check_path.name} plays at {video_s:.1f}s vs "
+            f"{target_s:.1f}s target -- still drifted")
+
+
 def build_command(exe: str, input_path: Path, output_path: Path,
                   factor: float) -> list[str]:
     """ffmpeg: re-time video with setpts, copy audio untouched."""
@@ -158,12 +195,14 @@ def retime(input_path: Path, target_s: float, output_path: Path,
 
     When ``details`` is a dict it is filled with ``encoded_s`` (the probed
     playback length, or None), ``stretch_factor`` (the setpts multiplier
-    applied, or None when nothing was stretched), and ``output`` (the
-    resolved output path) -- used by main() for the --json payload.
+    applied, or None when nothing was stretched), ``output`` (the
+    resolved output path), and ``repaired`` (True only when the repair
+    actually ran -- the already-real-time no-op writes nothing) -- used by
+    main() for the --json payload and --verify.
     """
     if details is not None:
         details.update(encoded_s=None, stretch_factor=None,
-                       output=str(output_path))
+                       output=str(output_path), repaired=False)
     if output_path.exists() and not force:
         return 2, (
             f"{output_path} already exists -- pass --force to overwrite "
@@ -207,6 +246,7 @@ def retime(input_path: Path, target_s: float, output_path: Path,
     out_note = f"{out_s:.1f}s" if out_s is not None else "unprobable"
     if details is not None:
         details["stretch_factor"] = factor
+        details["repaired"] = True
     return 0, (
         f"{input_path.name}: {encoded_s:.1f}s -> {out_note} "
         f"({factor:.1f}x stretch), wrote {output_path}"
@@ -217,18 +257,20 @@ def format_csv(payload: dict) -> str:
     """Render the single-clip result as a spreadsheet-friendly CSV.
 
     One header row (clip,output,exit_code,target_s,encoded_s,
-    stretch_factor,dry_run,message), then one data row. Durations are
-    one-decimal seconds, stretch_factor 3 decimals (empty when None, e.g.
-    already-real-time no-ops and probe failures); plain decimals so
-    spreadsheets and pandas parse cleanly; stdlib csv handles quoting, so
-    commas in messages round-trip.
+    stretch_factor,dry_run,verification,message), then one data row.
+    Durations are one-decimal seconds, stretch_factor 3 decimals (empty when
+    None, e.g. already-real-time no-ops and probe failures); verification is
+    the --verify status word (verified/drifted/unprobable/skipped, empty when
+    --verify wasn't used); plain decimals so spreadsheets and pandas parse
+    cleanly; stdlib csv handles quoting, so commas in messages round-trip.
     """
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["clip", "output", "exit_code", "target_s", "encoded_s",
-                     "stretch_factor", "dry_run", "message"])
+                     "stretch_factor", "dry_run", "verification", "message"])
     encoded = payload["encoded_s"]
     factor = payload["stretch_factor"]
+    verification = payload.get("verification") or {}
     writer.writerow([
         payload["clip"],
         payload["output"] or "",
@@ -237,6 +279,7 @@ def format_csv(payload: dict) -> str:
         f"{encoded:.1f}" if encoded is not None else "",
         f"{factor:.3f}" if factor is not None else "",
         "true" if payload["dry_run"] else "false",
+        verification.get("status", ""),
         payload["message"],
     ])
     return buf.getvalue()
@@ -263,6 +306,10 @@ def main(argv: list[str] | None = None,
                         "extreme stretch factors")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the ffmpeg command without running it")
+    parser.add_argument("--verify", action="store_true",
+                        help="re-probe the repaired output and confirm it "
+                        "plays at real time (a no-op repair verifies the "
+                        "input; --dry-run and failed repairs report skipped)")
     parser.add_argument("--json", action="store_true",
                         help="machine-readable JSON result on stdout "
                         "(stdout stays pure JSON)")
@@ -293,6 +340,28 @@ def main(argv: list[str] | None = None,
     code, message = retime(args.clip, target_s, output_path,
                            force=args.force, dry_run=args.dry_run,
                            probe=probe, run=run, details=details)
+
+    verification = None
+    if args.verify:
+        if args.dry_run:
+            verification = {"status": "skipped", "video_s": None,
+                            "note": "--dry-run wrote no files"}
+        elif code != 0:
+            verification = {"status": "skipped", "video_s": None,
+                            "note": "repair did not succeed"}
+        else:
+            # A no-op repair writes nothing, so verify the input itself
+            # (it just passed the real-time gate); a real repair is
+            # verified against the output file.
+            check_path = (output_path if details.get("repaired")
+                          else args.clip)
+            status, video_s, note = verify_output(check_path, target_s,
+                                                  probe=probe)
+            verification = {"status": status, "video_s": video_s,
+                            "note": note}
+        if verification["status"] in ("drifted", "unprobable"):
+            code = 1
+
     if args.json or args.csv:
         payload = {
             "clip": str(args.clip),
@@ -302,6 +371,7 @@ def main(argv: list[str] | None = None,
             "exit_code": code,
             "encoded_s": details["encoded_s"],
             "stretch_factor": details["stretch_factor"],
+            "verification": verification,
             "message": message,
         }
         if args.json:
@@ -309,10 +379,14 @@ def main(argv: list[str] | None = None,
             sys.stdout.write("\n")
         else:
             sys.stdout.write(format_csv(payload))
-    elif code == 0:
-        print(message)
     else:
-        print(f"retime_clip: {message}", file=sys.stderr)
+        stream = sys.stdout if code == 0 else sys.stderr
+        if code == 0:
+            print(message, file=stream)
+        else:
+            print(f"retime_clip: {message}", file=stream)
+        if verification is not None:
+            print(f"verify: {verification['note']}", file=stream)
     return code
 
 

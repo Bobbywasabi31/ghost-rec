@@ -146,17 +146,27 @@ python retime_clip.py clip.mp4 --dry-run      # print the ffmpeg command
 python retime_clip.py clip.mp4 --force        # overwrite output / allow extreme stretch
 python retime_clip.py clip.mp4 --json         # machine-readable result on stdout (pure JSON)
 python retime_clip.py clip.mp4 --csv          # same fields as CSV (pure CSV)
+python retime_clip.py clip.mp4 --verify       # re-probe the repaired output and confirm it plays at real time
 ```
 `--json` and `--csv` cannot be combined.
+
+`--verify` closes the single-clip loop the way `retime_all.py --verify`
+does for batches: after the repair, the output is re-probed and checked
+against the target duration with the same 10%/2s tolerance. A clip that
+needed no repair is verified against the input itself (nothing was
+written); `--dry-run` and failed repairs report `skipped`. A still-drifted
+or unprobable output fails the run with exit 1. The `--json` payload and
+the `--csv` row (new `verification` column) carry the result.
 
 Safety rails: refuses to write over the input or an existing output
 without `--force`; does nothing when the clip already plays at real time
 (same 10%/2s tolerance as `check_playback`); and treats a stretch factor
 beyond 120x as a probable bad log entry, requiring `--force`. Exit code
-is 1 when the clip can't be probed or ffmpeg fails, 2 on a usage error.
+is 1 when the clip can't be probed, ffmpeg fails, or `--verify` finds the
+output still drifted/unprobable; 2 on a usage error.
 The `--json` payload carries `clip`, `output`, `target_s`, `exit_code`,
-`encoded_s`, `stretch_factor`, and `message` — mirroring the other
-report tools in this family.
+`encoded_s`, `stretch_factor`, `verification`, and `message` — mirroring
+the other report tools in this family.
 
 `retime_all.py` (issue #1 follow-up) repairs *every* clip that
 `check_playback.py` flags `SPED_UP` in one pass — for when more than one

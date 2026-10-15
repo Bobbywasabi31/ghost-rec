@@ -43,6 +43,15 @@ def make_run(calls):
     return run
 
 
+def make_run_writes_output(calls):
+    """Canned ffmpeg that also creates the output file, like the real one."""
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        Path(cmd[-1]).write_bytes(b"\x00")
+        return fake_run_ok()
+    return run
+
+
 def touch(path: Path):
     path.write_bytes(b"\x00")  # exists; probe/run are canned
 
@@ -310,6 +319,7 @@ def test_json_success_carries_fields(tmp_path):
         "exit_code": 0,
         "encoded_s": 6.0,
         "stretch_factor": pytest.approx(100.0),
+        "verification": None,
         "message": payload["message"],
     }
     assert len(calls) == 1
@@ -423,11 +433,12 @@ def test_csv_success_carries_fields(tmp_path):
     )
     assert code == 0
     assert rows[0] == ["clip", "output", "exit_code", "target_s", "encoded_s",
-                       "stretch_factor", "dry_run", "message"]
+                       "stretch_factor", "dry_run", "verification", "message"]
     header, row = rows
     assert row[:7] == [str(clip), str(out), "0", "600.0", "6.0", "100.000",
                        "false"]
-    assert row[7]  # the human-readable success message rides along
+    assert row[7] == ""  # no --verify -> empty status column
+    assert row[8]  # the human-readable success message rides along
     assert len(calls) == 1
 
 
@@ -443,7 +454,8 @@ def test_csv_dry_run_marks_dry_run_and_factor(tmp_path):
     row = rows[1]
     assert row[5] == "40.000"
     assert row[6] == "true"
-    assert "setpts=40.000000*PTS" in row[7]
+    assert row[7] == ""  # no --verify -> empty status column
+    assert "setpts=40.000000*PTS" in row[8]
 
 
 def test_csv_already_realtime_has_empty_factor(tmp_path):
@@ -459,7 +471,8 @@ def test_csv_already_realtime_has_empty_factor(tmp_path):
     assert row[2] == "0"
     assert row[4] == "58.0"
     assert row[5] == ""  # no stretch applied
-    assert "nothing to do" in row[7]
+    assert row[7] == ""  # no --verify -> empty status column
+    assert "nothing to do" in row[8]
 
 
 def test_csv_failure_payload_is_still_parseable(tmp_path):
@@ -474,7 +487,8 @@ def test_csv_failure_payload_is_still_parseable(tmp_path):
     row = rows[1]
     assert row[2] == "1"
     assert row[4] == "" and row[5] == ""
-    assert row[7]
+    assert row[7] == ""  # no --verify -> empty status column
+    assert row[8]
 
 
 def test_csv_json_conflict_exits_2(tmp_path):
@@ -508,10 +522,216 @@ def test_format_csv_quotes_commas_in_message():
         "exit_code": 1,
         "encoded_s": None,
         "stretch_factor": None,
+        "verification": None,
         "message": 'hello, "world"',
     }
     rows = list(csv.reader(io.StringIO(retime_clip.format_csv(payload))))
-    assert rows[1][7] == 'hello, "world"'
+    assert rows[0][7] == "verification"
+    assert rows[1][7] == ""  # no --verify -> empty column
+    assert rows[1][8] == 'hello, "world"'
+
+
+def test_format_csv_verification_column_carries_status():
+    payload = {
+        "clip": "a.mp4",
+        "output": "a.retimed.mp4",
+        "target_s": 60.0,
+        "dry_run": False,
+        "exit_code": 0,
+        "encoded_s": 6.0,
+        "stretch_factor": 10.0,
+        "verification": {"status": "verified", "video_s": 59.8,
+                         "note": "plays at real time"},
+        "message": "repaired",
+    }
+    rows = list(csv.reader(io.StringIO(retime_clip.format_csv(payload))))
+    assert rows[1][7] == "verified"
+
+
+# --- --verify ---------------------------------------------------------------
+
+def _probe_by_name(mapping):
+    def probe(path):
+        return mapping.get(Path(path).name)
+    return probe
+
+
+def test_verify_output_verified(tmp_path):
+    out = tmp_path / "fixed.mp4"
+    touch(out)
+    status, video_s, note = retime_clip.verify_output(
+        out, 300.0, probe=_probe_by_name({"fixed.mp4": 299.5}))
+    assert status == "verified"
+    assert video_s == pytest.approx(299.5)
+    assert "real time" in note
+
+
+def test_verify_output_drifted(tmp_path):
+    out = tmp_path / "fixed.mp4"
+    touch(out)
+    status, video_s, note = retime_clip.verify_output(
+        out, 300.0, probe=_probe_by_name({"fixed.mp4": 6.0}))
+    assert status == "drifted"
+    assert video_s == pytest.approx(6.0)
+    assert "still drifted" in note
+
+
+def test_verify_output_unprobable(tmp_path):
+    out = tmp_path / "fixed.mp4"
+    touch(out)
+    status, video_s, note = retime_clip.verify_output(
+        out, 300.0, probe=_probe_by_name({}))
+    assert (status, video_s) == ("unprobable", None)
+    assert "could not probe" in note
+
+
+def test_verify_output_missing_file_is_skipped(tmp_path):
+    status, video_s, note = retime_clip.verify_output(
+        tmp_path / "nope.mp4", 300.0,
+        probe=_probe_by_name({"nope.mp4": 300.0}))
+    assert (status, video_s) == ("skipped", None)
+
+
+def test_main_verify_confirms_repaired_output(tmp_path, capsys):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    out = tmp_path / "fixed.mp4"
+    calls = []
+    probe = _probe_by_name({"clip.mp4": 6.0, "fixed.mp4": 299.5})
+    code = retime_clip.main(
+        [str(clip), "--duration", "300", "--output", str(out), "--verify"],
+        probe=probe, run=make_run_writes_output(calls),
+    )
+    assert code == 0
+    out_text, _ = capsys.readouterr()
+    assert "verify: fixed.mp4 plays at 299.5s vs 300.0s target" in out_text
+
+
+def test_main_verify_drifted_fails_exit_1(tmp_path, capsys):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    out = tmp_path / "fixed.mp4"
+    calls = []
+    probe = _probe_by_name({"clip.mp4": 6.0, "fixed.mp4": 6.0})
+    code = retime_clip.main(
+        [str(clip), "--duration", "300", "--output", str(out), "--verify"],
+        probe=probe, run=make_run_writes_output(calls),
+    )
+    assert code == 1
+    _, err = capsys.readouterr()
+    assert "verify: fixed.mp4 plays at 6.0s vs 300.0s target -- still drifted" \
+        in err
+
+
+def test_main_verify_unprobable_fails_exit_1(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    out = tmp_path / "fixed.mp4"
+    calls = []
+    probe = _probe_by_name({"clip.mp4": 6.0})
+    code = retime_clip.main(
+        [str(clip), "--duration", "300", "--output", str(out), "--verify"],
+        probe=probe, run=make_run_writes_output(calls),
+    )
+    assert code == 1
+
+
+def test_main_verify_noop_checks_the_input_itself(tmp_path, capsys):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    code = retime_clip.main(
+        [str(clip), "--duration", "60", "--verify"],
+        probe=canned_probe(59.5),
+    )
+    assert code == 0
+    out_text, _ = capsys.readouterr()
+    assert "already plays at real time" in out_text
+    assert "verify: clip.mp4 plays at 59.5s vs 60.0s target" in out_text
+
+
+def test_main_verify_dry_run_is_skipped(tmp_path, capsys):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    code = retime_clip.main(
+        [str(clip), "--duration", "300", "--dry-run", "--verify"],
+        probe=canned_probe(6.0),
+    )
+    assert code == 0
+    out_text, _ = capsys.readouterr()
+    assert "verify: --dry-run wrote no files" in out_text
+
+
+def test_main_verify_failed_repair_is_skipped(tmp_path, capsys):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    code = retime_clip.main(
+        [str(clip), "--duration", "300", "--verify"],
+        probe=canned_probe(None),
+    )
+    assert code == 1  # the repair's own failure, not the verify
+    _, err = capsys.readouterr()
+    assert "verify: repair did not succeed" in err
+
+
+def test_main_verify_stale_output_is_not_trusted(tmp_path):
+    # --force + already-real-time input: the default output name exists from
+    # an earlier repair, but nothing was written this run -- verify must
+    # check the input, not the stale file (which probes drifted).
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    stale = tmp_path / "clip.retimed.mp4"
+    touch(stale)
+    probe = _probe_by_name({"clip.mp4": 60.0, "clip.retimed.mp4": 6.0})
+    code = retime_clip.main(
+        [str(clip), "--duration", "60", "--force", "--verify"], probe=probe)
+    assert code == 0  # verified against the input, not the stale output
+
+
+def test_json_verify_carries_verification_payload(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    out = tmp_path / "fixed.mp4"
+    calls = []
+    probe = _probe_by_name({"clip.mp4": 6.0, "fixed.mp4": 299.5})
+    code, payload = _run_json(
+        tmp_path,
+        [str(clip), "--duration", "300", "--output", str(out),
+         "--verify", "--json"],
+        probe=probe, run=make_run_writes_output(calls),
+    )
+    assert code == 0
+    assert payload["verification"]["status"] == "verified"
+    assert payload["verification"]["video_s"] == pytest.approx(299.5)
+
+
+def test_json_without_verify_has_null_verification(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    code, payload = _run_json(
+        tmp_path, [str(clip), "--duration", "60", "--json"],
+        probe=canned_probe(59.5),
+    )
+    assert code == 0
+    assert payload["verification"] is None
+
+
+def test_csv_verify_carries_status_column(tmp_path, capsys):
+    clip = tmp_path / "clip.mp4"
+    touch(clip)
+    out = tmp_path / "fixed.mp4"
+    calls = []
+    probe = _probe_by_name({"clip.mp4": 6.0, "fixed.mp4": 299.5})
+    code = retime_clip.main(
+        [str(clip), "--duration", "300", "--output", str(out),
+         "--verify", "--csv"],
+        probe=probe, run=make_run_writes_output(calls),
+    )
+    assert code == 0
+    out_text, err = capsys.readouterr()
+    assert err == ""
+    rows = list(csv.reader(io.StringIO(out_text)))
+    assert rows[0][7] == "verification"
+    assert rows[1][7] == "verified"
 
 
 # --- end to end (real bundled ffmpeg) --------------------------------------
